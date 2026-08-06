@@ -7,6 +7,9 @@
   launch, first read `CLAUDE.md` and `.claude/agents/eval-operator.md`.
 - Treat the eval operator as the judgment layer: establish the experiment's
   intent, ground truth, validity conditions, fixed dimensions, and approval.
+- Before setup, write the measurement contract: what will run, what will be
+  reused or skipped, what each metric measures, what the result can support,
+  and what it cannot establish. Carry that contract into the final report.
 - Use `conductor` as the execution and record-keeping layer when the task needs
   to launch, monitor, score, compare, materialize, or reuse an evaluation.
 - Files ending in `.local.md` contain optional machine or deployment context.

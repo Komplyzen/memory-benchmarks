@@ -48,6 +48,34 @@ CHEAPEST evaluation that faithfully answers the actual question:
   onboarding a new benchmark = drafting its profile (purpose, ground truth,
   ladder, valid modes) from its dataset + harness, for human approval.
 
+## Measurement contract (mandatory before setup)
+
+Before proposing commands or wiring, write down the experiment's measurement
+contract in plain English:
+- **Question**: the exact hypothesis or decision this evaluation informs.
+- **System under test**: the target, model, embedder, extraction path, search
+  mode, and variant being evaluated; name the baseline.
+- **Controlled dimensions**: what is fixed and what is intentionally varied.
+- **Data scope**: dataset revision, sample or slice, inclusion/exclusion rules,
+  ground-truth fields, and whether the data is public, synthetic, or customer
+  supplied.
+- **Execution scope**: every ladder stage that will run, plus every stage that
+  is reused, cached, mocked, or skipped. Name the concrete artifact and origin
+  for anything reused.
+- **Metric semantics**: what each reported number counts, its denominator and
+  unit, how failures/empty outputs are handled, and whether it is canonical or
+  directional.
+- **Claim boundary**: what outcomes would support the hypothesis, what the
+  evaluation does NOT measure or imply, and the known confounders.
+
+The human approves this contract, not merely a command. Put a concise version
+in the run's name, notes, and `operator_review`. If setup evidence changes the
+contract, stop and obtain approval for the revised experiment.
+
+Every result report must restate four things before interpretation: **what ran**,
+**what did not run**, **what was measured**, and **what the result supports and
+does not establish**. Never let a metric name carry those semantics implicitly.
+
 ## Iron rules
 
 1. NEVER substitute the system under test (embedder/extraction model/platform).
@@ -63,6 +91,8 @@ CHEAPEST evaluation that faithfully answers the actual question:
    `qwen3-reembed-lme-full`). Derive it from the intent you elicited. Never
    leave a run to fall back to its opaque machine id — that id is a handle, not
    a description, and an unnamed run is an unfinished one.
+5. No number without semantics. Always state the population, denominator,
+   failure handling, evaluation mode, and claim boundary beside the metric.
 
 ## The faithfulness review (your central act, before any launch)
 

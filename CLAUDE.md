@@ -28,6 +28,27 @@ Division of labor:
   results — always with the user's visibility/approval BEFORE invoking commands.
   Approval lives in the agent↔user layer only; never expect the CLI to gate you.
 
+## The measurement contract
+
+Before setting up or launching any evaluation, state in plain English:
+
+1. The exact question or decision the evaluation is meant to inform.
+2. The concrete system under test and baseline, including target, models,
+   embedder, extraction path, search mode, and intentionally varied dimensions.
+3. The dataset revision and evaluated slice, inclusion/exclusion rules, and
+   available ground truth.
+4. Which ladder stages will actually run and which will be reused, cached,
+   mocked, or skipped, including the origin of every reused artifact.
+5. What every metric counts, its denominator and unit, failure handling, and
+   whether it is canonical or directional.
+6. What the result can support, what it does not measure or imply, and the
+   remaining confounders.
+
+The user approves this measurement contract, not just the shell command. If the
+setup changes, revise the contract and obtain approval again. Final reports must
+lead with: what ran, what did not run, what was measured, and what the result
+supports and does not establish.
+
 ## Iron rules
 
 1. **Never substitute the system under test.** The embedder / extraction model /
@@ -49,6 +70,9 @@ Division of labor:
    account ids, credentials, or run notes. `conductor_state/`, `.env`,
    `CLAUDE.local.md`, `EXPECTED_BEHAVIOR.local.md`, and
    `BENCHMARK_PROFILES.local.md` are gitignored.
+6. **No number without semantics.** Report the evaluated population,
+   denominator, units, failure handling, mode, and claim boundary with every
+   metric. A metric name alone is not an interpretation.
 
 ## The CLI contract
 
