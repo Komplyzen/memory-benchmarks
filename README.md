@@ -18,6 +18,30 @@ cd memory-benchmarks
 pip install -r requirements.txt
 ```
 
+### Evaluation operator and Conductor
+
+This repository includes a shared evaluation operator for designing faithful
+memory-system evaluations and `conductor`, the CLI that launches, records,
+scores, compares, and reuses their artifacts.
+
+Claude reads [`CLAUDE.md`](CLAUDE.md) and the specialized
+[`.claude/agents/eval-operator.md`](.claude/agents/eval-operator.md). Codex and
+other agents that support the convention read [`AGENTS.md`](AGENTS.md). These
+files contain the shared methodology; machine-specific endpoints, credentials,
+and customer data stay in ignored local files.
+
+Install the CLI in the same environment as the benchmark dependencies:
+
+```bash
+python -m pip install -e .
+python -m conductor --help
+```
+
+For a custom or customer-provided evaluation, first define the capability,
+ground truth, and valid scoring mode. Then add a benchmark runner and scorer and
+register the runner with Conductor. The detailed onboarding contract is in
+[`CLAUDE.md`](CLAUDE.md#onboard-a-custom-benchmark-or-customer-dataset).
+
 ### Option A: Mem0 Cloud
 
 No Docker required. You need a [Mem0 API key](https://app.mem0.ai) and an OpenAI API key (for the answerer/judge LLM).
