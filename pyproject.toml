@@ -1,0 +1,18 @@
+[project]
+name = "conductor"
+version = "0.1.0"
+description = "A lab notebook with hands for running memory-system evals (wraps benchmarks/*/run.py)."
+requires-python = ">=3.10"
+dependencies = []  # stdlib only
+
+[project.scripts]
+conductor = "conductor.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# Only package conductor/ -- this repo root is primarily a Next.js app; do not let
+# setuptools auto-discover benchmarks/, scripts/, etc.
+packages = ["conductor"]

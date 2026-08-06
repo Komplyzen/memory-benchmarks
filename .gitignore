@@ -38,3 +38,13 @@ tsconfig.tsbuildinfo
 next-env.d.ts
 mem0-config.yaml
 mem0-config-*.yaml
+
+# Conductor local state (per-run dirs, logs, origin stories, artifact shelf/exports)
+# -- may reference internal targets; never commit to this public repo.
+conductor_state/
+conductor.egg-info/
+
+# Internal operator notes (endpoints, accounts, runbooks) -- never commit.
+CLAUDE.local.md
+EXPECTED_BEHAVIOR.local.md
+BENCHMARK_PROFILES.local.md
