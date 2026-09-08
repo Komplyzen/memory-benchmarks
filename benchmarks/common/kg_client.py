@@ -18,26 +18,35 @@ every tool with ``currentSession = null`` and ``kg_node`` refuses to create
 without an active session. The MCP route resolves the tenant's active session
 per request, which is exactly the path production agents use.
 
+Ingest: "Komplyt Zero as shipped"
+---------------------------------
+``add`` hands each dataset session to an LLM agent equipped with the KG's own
+MCP tools (``kg_agent_ingest.AgentIngestor``). The model decides what to call
+(kg_session, kg_query, kg_node, kg_update, ...). The harness enforces only:
+
+- every ``kg_node`` / ``kg_record`` create gets ``project=bench-{user_id}`` and
+  a ``date:YYYY-MM-DD`` tag (the date never goes into ``content``);
+- a write without an active session first gets a harness-started session;
+- ``kg_session start`` by the model is deduplicated against the session the
+  harness already opened for this (user, dataset session), and forced onto the
+  benchmark project, so decay fires once per dataset session, not per whim;
+- if the model did not end the session, the harness ends it after the loop.
+- ``decay="off"``: one long-lived session per run; model start/end calls are
+  acknowledged but not executed, so decay never fires.
+
 Mapping
 -------
-- ``user_id``  -> one KG **project** named ``bench-{user_id}``. Project is the
-  unit ``applySessionDecay`` scopes by, so it is the isolation unit here too.
-  Every ``kg_node`` create and every ``kg_query`` passes ``project`` explicitly.
-- one dataset session (a distinct ``timestamp`` for a user) -> one KG session
-  (``kg_session start`` / ``end``), so session decay runs through the real
-  path, in dataset order. ``decay="off"`` never ends/starts sessions between
-  dataset sessions (one long-lived session per run), so decay never fires.
-- the dataset session date is stored as a tag ``date:YYYY-MM-DD`` (never in
-  ``content``, which would skew embeddings) and prepended to the memory text
-  when search results are formatted for the answerer.
+- ``user_id`` -> one KG **project** ``bench-{user_id}``, the unit
+  ``applySessionDecay`` scopes by. Every query passes ``project`` explicitly.
+- ``search`` is one ``kg_query`` with ``read_only=true`` (no implicit
+  activation), spread per variant, truncated to ``top_k``.
 - ``delete_user`` wipes the project via a **root** SurrealDB connection on the
-  local instance (there is no tenant-scoped wipe route). Refuses ``KG_DB_NAME=main``.
+  local instance (no tenant-scoped wipe route exists). Refuses ``KG_DB_NAME=main``.
 
 Concurrency
 -----------
-KG sessions are tenant-global (one active session per tenant), so ingest is
-serialized with a lock and the runners force ``--max-workers 1`` for this
-backend. Search is read-only (``read_only=true``) and runs concurrently.
+KG sessions are tenant-global, so ingest is serialized with a lock and the
+runners force ``--max-workers 1`` for this backend. Search runs concurrently.
 """
 
 from __future__ import annotations
@@ -56,10 +65,11 @@ from typing import Any
 import aiohttp
 from aiolimiter import AsyncLimiter
 
-from benchmarks.common.kg_extract import (
-    PROMPT_VERSION,
-    KgExtractor,
-    prompt_sha256,
+from benchmarks.common.kg_agent_ingest import (
+    AgentIngestor,
+    McpToolContract,
+    ScriptedIngestor,
+    contract_from_mcp,
 )
 
 logger = logging.getLogger(__name__)
@@ -67,7 +77,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_KG_URL = "http://localhost:3000"
 CREDENTIALS_PATH = Path.home() / ".kg" / "credentials.json"
 MAX_QUERY_LIMIT = 100  # kg_query limit cap (contracts.ts)
-MAX_RELATES_PER_CREATE = 20  # kg_node relates_to cap (contracts.ts)
 SPREAD_HOPS = 2
 # Client-side cap, well under the KG's per-principal MCP limit (1000/min) and
 # the REST limit (500/min), so the server-side limiter is never the thing
@@ -78,6 +87,7 @@ KG_TOKEN_HINT = (
     "KG returned 401 Unauthorized. Run `kg auth login` (Knowledge-Graph/src/bin/kg.ts) "
     "against staging Komplyt, or set KG_TOKEN."
 )
+WRITE_TOOLS = frozenset({"kg_node", "kg_record", "kg_relate", "kg_update"})
 
 
 class KgError(RuntimeError):
@@ -142,13 +152,14 @@ class KgClient:
         spread: Send ``spread=true`` on kg_query (spreading activation).
         decay: "on" = one KG session per dataset session (decay fires between
             them); "off" = one long-lived session, decay never fires.
-        extractor_model / extractor_provider: LLM used to turn turns into nodes.
+        agent_model / agent_provider: LLM driving the MCP tools during ingest.
+        max_tool_calls: Per-dataset-session cap on agent tool calls.
+        ingestor: Override the ingestor (e.g. ``ScriptedIngestor()`` for smoke).
         rpm: Client-side KG requests per minute cap.
-        llm_rpm: Extraction LLM requests per minute.
+        llm_rpm: Agent LLM requests per minute.
         max_retries / retry_delay / timeout: HTTP retry policy.
-        db_url / db_user / db_pass / db_ns / db_name: root SurrealDB access for
-            ``delete_user``. Env: KG_DB_URL (http form), KG_DB_USER, KG_DB_PASS,
-            KG_DB_NS, KG_DB_NAME.
+        db_*: root SurrealDB access for ``delete_user``. Env: KG_DB_URL (http
+            form), KG_DB_USER, KG_DB_PASS, KG_DB_NS, KG_DB_NAME.
     """
 
     def __init__(
@@ -157,8 +168,10 @@ class KgClient:
         token: str | None = None,
         spread: bool = True,
         decay: str = "on",
-        extractor_model: str = "gpt-4o-mini",
-        extractor_provider: str = "openai",
+        agent_model: str = "gpt-5-mini",
+        agent_provider: str = "openai",
+        max_tool_calls: int = 12,
+        ingestor: Any | None = None,
         rpm: int = DEFAULT_RPM,
         llm_rpm: int = 200,
         max_retries: int = 5,
@@ -180,7 +193,10 @@ class KgClient:
         self.retry_delay = retry_delay
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.limiter = AsyncLimiter(min(rpm, DEFAULT_RPM), 60)
-        self.extractor = KgExtractor(model=extractor_model, provider=extractor_provider, rpm=llm_rpm)
+        self.ingestor = ingestor or AgentIngestor(
+            model=agent_model, provider=agent_provider, max_tool_calls=max_tool_calls, rpm=llm_rpm,
+        )
+        self.ingest_mode = "scripted-stub" if isinstance(self.ingestor, ScriptedIngestor) else "mcp-agent"
 
         self.db_url = (db_url or os.getenv("KG_DB_URL", "http://localhost:8000")).rstrip("/")
         self.db_user = db_user or os.getenv("KG_DB_USER", "root")
@@ -191,14 +207,28 @@ class KgClient:
         self._session: aiohttp.ClientSession | None = None
         self._rpc_id = 0
         self._initialized = False
+        self._init_result: dict[str, Any] | None = None
+        self._contract: McpToolContract | None = None
 
         # Ingest state. Sessions are tenant-global, hence one lock for all users.
         self._ingest_lock = asyncio.Lock()
+        # The runners call add() per chunk (LoCoMo: one turn; LongMemEval: one
+        # user/assistant pair). The agent must see a whole dataset session, so
+        # chunks are buffered until the (user_id, timestamp) key changes and
+        # flushed as one agent session (also on search/close/delete_user).
+        self._pending: dict[str, Any] | None = None  # {"user_id", "key", "date_tag", "messages"}
         self._open_session: dict[str, Any] | None = None  # {"id", "user_id", "key"}
         self._projects_ready: set[str] = set()
-        self._node_ids: dict[str, list[str]] = {}       # user_id -> created node ids (global index order)
-        self._node_contents: dict[str, list[str]] = {}  # user_id -> contents (same order)
-        self._last_session_key: dict[str, Any] = {}     # user_id -> last dataset-session key
+        self._created: dict[str, list[tuple[str, str]]] = {}  # user_id -> [(node_id, content)]
+        self.guardrails: dict[str, int] = {
+            "session_started_by_harness": 0,
+            "session_ended_by_harness": 0,
+            "session_start_deduped": 0,
+            "session_end_deferred": 0,
+            "project_injected": 0,
+            "date_tag_added": 0,
+            "tool_errors_returned_to_model": 0,
+        }
 
     # ------------------------------------------------------------------
     # HTTP / JSON-RPC plumbing
@@ -223,12 +253,19 @@ class KgClient:
 
     async def close(self) -> None:
         try:
-            if self._open_session is not None:
-                await self._end_session()
+            async with self._ingest_lock:
+                await self._flush_pending()
+                if self._open_session is not None:
+                    await self._end_session(by_harness=True)
         except Exception as exc:
-            logger.warning("Failed to end KG session on close: %s", exc)
+            logger.warning("Failed to flush/end KG session on close: %s", exc)
         if self._session and not self._session.closed:
             await self._session.close()
+        stats = getattr(self.ingestor, "stats", None)
+        if stats is not None and stats.sessions:
+            line = stats.summary_line()
+            logger.info(line)
+            print(f"  {line}")
 
     async def __aenter__(self) -> KgClient:
         return self
@@ -283,22 +320,58 @@ class KgClient:
     async def _ensure_initialized(self) -> None:
         if self._initialized:
             return
-        await self._rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "memory-benchmarks-kg", "version": "0.1"}})
+        result = await self._rpc("initialize", {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "memory-benchmarks-kg", "version": "0.2"},
+        })
+        self._init_result = result if isinstance(result, dict) else {}
         self._initialized = True
 
-    async def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def _call_tool_raw(self, name: str, arguments: dict[str, Any]) -> tuple[dict[str, Any] | None, str, bool]:
+        """Returns (parsed_json_or_None, text, is_error)."""
         await self._ensure_initialized()
         result = await self._rpc("tools/call", {"name": name, "arguments": arguments})
         if not isinstance(result, dict):
             raise KgError(f"{name}: unexpected result {result!r}")
         content = result.get("content") or []
         text = content[0].get("text", "") if content and isinstance(content[0], dict) else ""
-        if result.get("isError"):
+        is_error = bool(result.get("isError"))
+        parsed: dict[str, Any] | None = None
+        if not is_error and text:
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                parsed = None
+        return parsed, text, is_error
+
+    async def _call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        parsed, text, is_error = await self._call_tool_raw(name, arguments)
+        if is_error:
             raise KgToolError(f"{name}: {text}")
-        try:
-            return json.loads(text) if text else {}
-        except json.JSONDecodeError as exc:
-            raise KgError(f"{name}: non-JSON tool result: {text[:200]}") from exc
+        if parsed is None:
+            if not text:
+                return {}
+            raise KgError(f"{name}: non-JSON tool result: {text[:200]}")
+        return parsed
+
+    # ------------------------------------------------------------------
+    # Tool contract (fetched once)
+    # ------------------------------------------------------------------
+
+    async def tool_contract(self) -> McpToolContract:
+        if self._contract is None:
+            await self._ensure_initialized()
+            listed = await self._rpc("tools/list", {})
+            tools = listed.get("tools", []) if isinstance(listed, dict) else []
+            instructions = (self._init_result or {}).get("instructions")
+            self._contract = contract_from_mcp(tools, instructions if isinstance(instructions, str) else None)
+            logger.info("KG tool contract: %d tools, sha256=%s", len(tools), self._contract.sha256[:12])
+        return self._contract
+
+    @property
+    def tool_contract_sha256(self) -> str | None:
+        return self._contract.sha256 if self._contract else None
 
     # ------------------------------------------------------------------
     # Session management (tenant-global; caller holds _ingest_lock)
@@ -311,46 +384,145 @@ class KgClient:
             raise KgError(f"user_id {user_id!r} produces an unsafe project name")
         return name
 
-    async def _start_session(self, user_id: str, key: Any) -> dict[str, Any]:
+    def _session_matches(self, user_id: str, key: Any) -> bool:
+        cur = self._open_session
+        return cur is not None and cur["user_id"] == user_id and cur["key"] == key
+
+    async def _start_session(self, user_id: str, key: Any, notes: str | None = None) -> dict[str, Any]:
         project = self.project_for(user_id)
         resp = await self._call_tool("kg_session", {
             "action": "start",
             "project": project,
             "create_project": True,
-            "notes": f"memory-benchmarks {user_id} session={key}",
+            "notes": notes or f"memory-benchmarks {user_id} session={key}",
         })
         self._projects_ready.add(project)
         self._open_session = {"id": resp.get("session_id"), "user_id": user_id, "key": key}
         logger.debug("KG session started for %s key=%s decayed=%s", user_id, key, resp.get("nodes_decayed"))
         return resp
 
-    async def _end_session(self) -> None:
+    async def _end_session(self, by_harness: bool = False) -> dict[str, Any]:
         if self._open_session is None:
-            return
+            return {}
         try:
-            await self._call_tool("kg_session", {"action": "end"})
+            resp = await self._call_tool("kg_session", {"action": "end"})
         finally:
             self._open_session = None
+        if by_harness:
+            self.guardrails["session_ended_by_harness"] += 1
+        return resp
 
-    async def _ensure_session_for_add(self, user_id: str, key: Any) -> None:
-        """Bring the tenant's active session into the state this add needs."""
+    async def _ensure_session_for_write(self, user_id: str, key: Any) -> None:
+        """Harness-side: make sure a session that fits this add is active."""
         project = self.project_for(user_id)
         if self.decay == "off":
-            # Only ever start a session when a project must be created (an
-            # empty project decays nothing), and never end one mid-run.
-            if project not in self._projects_ready:
+            # Start only when the project must be created (an empty project
+            # decays nothing) or no session is open at all; never end mid-run.
+            if project not in self._projects_ready or self._open_session is None:
                 await self._start_session(user_id, key)
-            elif self._open_session is None:
-                await self._start_session(user_id, key)
+                self.guardrails["session_started_by_harness"] += 1
             return
-
-        # decay == "on": one KG session per (user_id, dataset session).
-        cur = self._open_session
-        if cur is not None and cur["user_id"] == user_id and cur["key"] == key:
+        if self._session_matches(user_id, key):
             return
-        if cur is not None:
-            await self._end_session()
+        if self._open_session is not None:
+            await self._end_session(by_harness=True)
         await self._start_session(user_id, key)
+        self.guardrails["session_started_by_harness"] += 1
+
+    # ------------------------------------------------------------------
+    # Guardrailed tool execution for the agent
+    # ------------------------------------------------------------------
+
+    def _make_executor(self, user_id: str, key: Any, date_tag: str | None):
+        project = self.project_for(user_id)
+        created = self._created.setdefault(user_id, [])
+
+        async def execute(name: str, args: dict[str, Any]) -> str:
+            args = dict(args)
+            try:
+                if name == "kg_session":
+                    return await self._exec_session(args, user_id, key)
+
+                if name in ("kg_node", "kg_record"):
+                    is_create = name == "kg_record" or args.get("action", "create") == "create"
+                    await self._ensure_session_for_write(user_id, key)
+                    if is_create:
+                        if args.get("project") != project:
+                            self.guardrails["project_injected"] += 1
+                        args["project"] = project
+                        args.pop("container", None)
+                        tags = [str(t) for t in (args.get("tags") or []) if str(t).strip()]
+                        if date_tag and f"date:{date_tag}" not in tags:
+                            tags.append(f"date:{date_tag}")
+                            self.guardrails["date_tag_added"] += 1
+                        tags.append(f"bench:{user_id}")
+                        args["tags"] = tags
+                    parsed, text, is_error = await self._call_tool_raw(name, args)
+                    if is_error:
+                        self.guardrails["tool_errors_returned_to_model"] += 1
+                        return f"Error: {text}"
+                    if is_create and parsed and parsed.get("id"):
+                        created.append((parsed["id"], parsed.get("content", args.get("content", ""))))
+                    return text
+
+                if name in WRITE_TOOLS:  # kg_relate, kg_update
+                    await self._ensure_session_for_write(user_id, key)
+                elif name == "kg_query":
+                    if args.get("project") != project:
+                        self.guardrails["project_injected"] += 1
+                    args["project"] = project
+
+                _, text, is_error = await self._call_tool_raw(name, args)
+                if is_error:
+                    self.guardrails["tool_errors_returned_to_model"] += 1
+                    return f"Error: {text}"
+                return text
+            except KgAuthError:
+                raise
+            except KgError as exc:
+                self.guardrails["tool_errors_returned_to_model"] += 1
+                return f"Error: {exc}"
+
+        return execute
+
+    async def _exec_session(self, args: dict[str, Any], user_id: str, key: Any) -> str:
+        action = args.get("action")
+        if action is None:
+            action = "status" if self._open_session is not None else "start"
+
+        if action == "start":
+            if self._session_matches(user_id, key) or (self.decay == "off" and self._open_session is not None
+                                                        and self.project_for(user_id) in self._projects_ready):
+                self.guardrails["session_start_deduped"] += 1
+                return json.dumps({
+                    "action": "started",
+                    "session_id": self._open_session["id"],
+                    "project": self.project_for(user_id),
+                    "nodes_decayed": 0,
+                    "note": "Session already active for this conversation.",
+                })
+            if self._open_session is not None:
+                if self.decay == "off":
+                    # Different project, decay off: the new project must exist; an
+                    # empty project decays nothing, so this start is harmless.
+                    pass
+                else:
+                    await self._end_session(by_harness=True)
+            resp = await self._start_session(user_id, key, notes=args.get("notes"))
+            return json.dumps(resp)
+
+        if action == "end":
+            if self.decay == "off":
+                self.guardrails["session_end_deferred"] += 1
+                return json.dumps({"action": "ended", "session_id": (self._open_session or {}).get("id"),
+                                   "note": "Acknowledged."})
+            if self._open_session is None:
+                return "Error: No active session. Start a session first with kg_session."
+            resp = await self._end_session()
+            return json.dumps(resp)
+
+        _, text, is_error = await self._call_tool_raw("kg_session", args)
+        return f"Error: {text}" if is_error else text
 
     # ------------------------------------------------------------------
     # Add
@@ -365,52 +537,50 @@ class KgClient:
         custom_instructions: str | None = None,
         metadata: dict | None = None,
     ) -> dict | None:
-        """Extract nodes from ``messages`` and record them. Returns
-        ``{"results": [{"id", "memory", "event": "ADD"}, ...]}`` or None on failure."""
+        """Buffer one chunk of a dataset session. When the (user_id, timestamp)
+        key changes, the buffered session is handed to the agent as a whole.
+        Returns ``{"results": [{"id", "memory", "event": "ADD"}, ...]}`` for
+        nodes created by a flush triggered by this call (empty while buffering),
+        or None if that flush failed."""
         date_tag = _date_tag_from(timestamp, observation_date)
         session_key = timestamp if timestamp is not None else (observation_date or "undated")
-        project = self.project_for(user_id)
-
-        ids = self._node_ids.setdefault(user_id, [])
-        contents = self._node_contents.setdefault(user_id, [])
+        self.project_for(user_id)  # validate early
 
         async with self._ingest_lock:
-            try:
-                await self._ensure_session_for_add(user_id, session_key)
-                self._last_session_key[user_id] = session_key
+            flushed: dict | None = {"results": []}
+            pending = self._pending
+            if pending is not None and (pending["user_id"] != user_id or pending["key"] != session_key):
+                flushed = await self._flush_pending()
+            if self._pending is None:
+                self._pending = {"user_id": user_id, "key": session_key, "date_tag": date_tag, "messages": []}
+            self._pending["messages"].extend(messages)
+            return flushed
 
-                prior = list(enumerate(contents))
-                extracted = await self.extractor.extract(messages, prior=prior, date_str=date_tag)
+    async def _flush_pending(self) -> dict | None:
+        """Run the agent over the buffered dataset session. Caller holds the lock."""
+        pending, self._pending = self._pending, None
+        if pending is None or not pending["messages"]:
+            return {"results": []}
+        user_id, session_key, date_tag = pending["user_id"], pending["key"], pending["date_tag"]
+        try:
+            contract = await self.tool_contract()
+            if self.decay == "on" and self._open_session is not None and not self._session_matches(user_id, session_key):
+                # Previous dataset session left open by the model: close it so
+                # decay fires exactly once per dataset session.
+                await self._end_session(by_harness=True)
 
-                results: list[dict[str, Any]] = []
-                base_index = len(ids)
-                for node in extracted:
-                    relates_to = [ids[i] for i in node["relates_to_indices"] if 0 <= i < base_index][:MAX_RELATES_PER_CREATE]
-                    tags = list(node["tags"])
-                    if date_tag:
-                        tags.append(f"date:{date_tag}")
-                    tags.append(f"bench:{user_id}")
-                    args: dict[str, Any] = {
-                        "action": "create",
-                        "type": node["type"],
-                        "content": node["content"],
-                        "project": project,
-                        "tags": tags,
-                    }
-                    if relates_to:
-                        args["relates_to"] = relates_to
-                    created = await self._call_tool("kg_node", args)
-                    node_id = created.get("id", "")
-                    ids.append(node_id)
-                    contents.append(node["content"])
-                    results.append({"id": node_id, "memory": node["content"], "event": "ADD",
-                                    "edges_created": created.get("edges_created", 0)})
-                return {"results": results}
-            except KgAuthError:
-                raise
-            except Exception as exc:
-                logger.error("KG add failed for user=%s: %s", user_id, str(exc)[:300])
-                return None
+            created = self._created.setdefault(user_id, [])
+            before = len(created)
+            execute = self._make_executor(user_id, session_key, date_tag)
+            await self.ingestor.run_session(pending["messages"], contract=contract, execute_tool=execute, date_str=date_tag)
+
+            new = created[before:]
+            return {"results": [{"id": nid, "memory": content, "event": "ADD"} for nid, content in new]}
+        except KgAuthError:
+            raise
+        except Exception as exc:
+            logger.error("KG ingest failed for user=%s session=%s: %s", user_id, session_key, str(exc)[:300])
+            return None
 
     # ------------------------------------------------------------------
     # Search
@@ -426,16 +596,18 @@ class KgClient:
     ) -> dict[str, Any] | list[dict]:
         """Read-only kg_query scoped to the user's project.
 
-        Returns ``{"results": [...], "query_debug": {...}}`` — ``format_search_results``
+        Returns ``{"results": [...], "query_debug": {...}}``; ``format_search_results``
         accepts this dict form and surfaces ``query_debug`` into the result JSON,
         which is where the pre/post-truncation counts live (spec CAP-6).
         """
-        if self._open_session is not None:
-            # All ingest for this run is done by the time search starts; close
-            # the trailing session so the last dataset session is "ended" like
-            # every other one. Harmless if another search already did it.
+        if self._pending is not None or self._open_session is not None:
+            # Ingest for this conversation is done by the time search starts:
+            # flush the buffered last dataset session and close the trailing KG
+            # session so it is "ended" like every other one.
             async with self._ingest_lock:
-                await self._end_session()
+                await self._flush_pending()
+                if self._open_session is not None:
+                    await self._end_session(by_harness=True)
 
         limit = max(1, min(int(top_k), MAX_QUERY_LIMIT))
         args: dict[str, Any] = {
@@ -508,11 +680,33 @@ class KgClient:
         return None
 
     # ------------------------------------------------------------------
+    # Metadata
+    # ------------------------------------------------------------------
+
+    def ingest_metadata(self) -> dict[str, Any]:
+        """Run-level ingest facts, merged into the result file's metadata."""
+        meta: dict[str, Any] = {
+            "kg_ingest_mode": self.ingest_mode,
+            "kg_agent_model": getattr(self.ingestor, "model", None),
+            "kg_agent_provider": getattr(self.ingestor, "provider", None),
+            "kg_agent_max_tool_calls": getattr(self.ingestor, "max_tool_calls", None),
+            "tool_contract_sha256": self.tool_contract_sha256,
+            "tool_descriptions_truncated_for_openai": list(self._contract.truncated_descriptions) if self._contract else [],
+            "kg_guardrails": dict(self.guardrails),
+        }
+        stats = getattr(self.ingestor, "stats", None)
+        if stats is not None:
+            meta.update(stats.as_metadata())
+        return meta
+
+    # ------------------------------------------------------------------
     # Delete (root SurrealDB, local instance only)
     # ------------------------------------------------------------------
 
     async def delete_user(self, user_id: str) -> bool:
         project = self.project_for(user_id)
+        if self._pending is not None and self._pending["user_id"] == user_id:
+            self._pending = None  # never ingested; nothing to keep
         if not self.db_name:
             logger.error("delete_user: KG_DB_NAME not set; refusing to guess")
             return False
@@ -557,9 +751,7 @@ DELETE project WHERE id = $p;
         if self._open_session and self._open_session.get("user_id") == user_id:
             self._open_session = None
         self._projects_ready.discard(project)
-        self._node_ids.pop(user_id, None)
-        self._node_contents.pop(user_id, None)
-        self._last_session_key.pop(user_id, None)
+        self._created.pop(user_id, None)
         logger.info("Wiped KG project %s", project)
         return True
 
@@ -589,21 +781,34 @@ def kg_variant(spread: bool, decay: str) -> str:
     return "no-spread-no-decay"
 
 
+def build_backend_metadata(args: Any, backend: str) -> dict[str, Any]:
+    """Static metadata for non-mem0 backends (spec CAP-7). Run-level counters
+    are added later via ``client.ingest_metadata()``."""
+    if backend == "kg":
+        spread = getattr(args, "kg_spread", "on") == "on"
+        decay = getattr(args, "kg_decay", "on")
+        return {
+            "memory_backend": "kg",
+            "kg_url": getattr(args, "kg_url", None) or os.getenv("KG_URL", DEFAULT_KG_URL),
+            "kg_variant": kg_variant(spread, decay),
+            "kg_spread": spread,
+            "kg_decay": decay,
+            "kg_spread_hops": SPREAD_HOPS,
+            "kg_query_limit_cap": MAX_QUERY_LIMIT,
+            "kg_commit": _kg_commit(),
+            "kg_ingest_mode": "mcp-agent",
+            "kg_agent_model": getattr(args, "kg_agent_model", "gpt-5-mini"),
+            "kg_agent_provider": getattr(args, "kg_agent_provider", "openai"),
+            "kg_embed_provider": os.getenv("KG_EMBED_PROVIDER"),
+        }
+    if backend == "none":
+        return {
+            "memory_backend": "none",
+            "none_context_token_budget": getattr(args, "none_context_tokens", None),
+        }
+    return {}
+
+
+# Backwards-compatible alias used by earlier runner wiring.
 def build_kg_metadata(args: Any) -> dict[str, Any]:
-    """Metadata fields for a ``--backend kg`` run (spec CAP-7)."""
-    spread = getattr(args, "kg_spread", "on") == "on"
-    decay = getattr(args, "kg_decay", "on")
-    return {
-        "memory_backend": "kg",
-        "kg_url": getattr(args, "kg_url", None) or os.getenv("KG_URL", DEFAULT_KG_URL),
-        "kg_variant": kg_variant(spread, decay),
-        "kg_spread": spread,
-        "kg_decay": decay,
-        "kg_spread_hops": SPREAD_HOPS,
-        "kg_query_limit_cap": MAX_QUERY_LIMIT,
-        "kg_commit": _kg_commit(),
-        "kg_extract_model": getattr(args, "kg_extract_model", "gpt-4o-mini"),
-        "kg_extract_prompt_version": PROMPT_VERSION,
-        "kg_extract_prompt_sha256": prompt_sha256(),
-        "kg_embed_provider": os.getenv("KG_EMBED_PROVIDER"),
-    }
+    return build_backend_metadata(args, "kg")

@@ -44,7 +44,8 @@ from tqdm import tqdm
 
 from benchmarks.common.llm_client import LLMClient
 from benchmarks.common.mem0_client import Mem0Client, format_search_results
-from benchmarks.common.kg_client import KgClient, build_kg_metadata
+from benchmarks.common.kg_client import KgClient, build_backend_metadata
+from benchmarks.common.none_client import NoMemoryClient
 from benchmarks.common.metrics import compute_overall_metrics
 from benchmarks.common.schema import (
     CutoffResult,
@@ -57,6 +58,7 @@ from benchmarks.common.schema import (
     UnifiedResult,
 )
 from benchmarks.common.utils import (
+    FULL_CONTEXT_CUTOFF,
     Checkpoint,
     GracefulShutdown,
     IngestionCheckpoint,
@@ -710,12 +712,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--user-profile", action="store_true", help="Fetch user profiles")
     parser.add_argument("--max-questions", type=int, default=None, help="Max questions to process (for quick testing)")
     parser.add_argument("--rpm", type=int, default=200, help="Requests per minute for LLM")
-    parser.add_argument("--backend", default="oss", choices=["oss", "cloud", "kg"],
-                        help="Memory backend: 'oss' for self-hosted Mem0 (default), 'cloud' for api.mem0.ai, 'kg' for the Komplyt KG")
+    parser.add_argument("--backend", default="oss", choices=["oss", "cloud", "kg", "none"],
+                        help="Memory backend: 'oss' for self-hosted Mem0 (default), 'cloud' for api.mem0.ai, 'kg' for the Komplyt KG, 'none' for the full-context floor (no memory system)")
     parser.add_argument("--kg-url", default=None, help="Komplyt KG HTTP server URL (kg backend; default http://localhost:3000)")
     parser.add_argument("--kg-spread", default="on", choices=["on", "off"], help="kg backend: spreading activation on kg_query")
     parser.add_argument("--kg-decay", default="on", choices=["on", "off"], help="kg backend: one KG session per dataset session (on) or a single session for the run (off)")
-    parser.add_argument("--kg-extract-model", default="gpt-4o-mini", help="kg backend: extraction model")
+    parser.add_argument("--kg-agent-model", default="gpt-5-mini", help="kg backend: model of the agent that drives the KG's MCP tools during ingest")
+    parser.add_argument("--kg-agent-provider", default="openai", choices=["openai", "anthropic", "azure", "mistral"], help="kg backend: provider for the ingest agent (mistral uses the OpenAI-compatible endpoint, MISTRAL_API_KEY)")
+    parser.add_argument("--kg-max-tool-calls", type=int, default=12, help="kg backend: max tool calls per dataset session")
+    parser.add_argument("--none-context-tokens", type=int, default=150_000, help="none backend: token budget for the full transcript (oldest sessions dropped first)")
     parser.add_argument("--mem0-host", default=None,
                         help="Mem0 server URL (default: http://localhost:8888 for oss, https://api.mem0.ai for cloud)")
     parser.add_argument("--mem0-api-key", default=None,
@@ -731,9 +736,12 @@ def parse_args() -> argparse.Namespace:
 async def async_main() -> None:
     args = parse_args()
     logger = setup_logging("locomo", debug=args.debug)
-    kg_meta = build_kg_metadata(args) if os.getenv("MEM0_BACKEND", args.backend) == "kg" else {}
+    backend = os.getenv("MEM0_BACKEND", args.backend)
+    kg_meta = build_backend_metadata(args, backend)
 
     cutoffs = parse_cutoffs(args.top_k_cutoffs)
+    if backend == "none":
+        cutoffs = [FULL_CONTEXT_CUTOFF]  # whole transcript is one memory
     categories = [int(c) for c in args.categories.split(",")]
     conv_indices = [int(c) for c in args.conversations.split(",")]
 
@@ -835,7 +843,6 @@ async def async_main() -> None:
         return
 
     # Init memory backend (not used for --evaluate-only)
-    backend = os.getenv("MEM0_BACKEND", args.backend)
     if backend == "kg":
         if args.max_workers != 1:
             # KG sessions are tenant-global: interleaved ingest would attach
@@ -846,10 +853,13 @@ async def async_main() -> None:
             url=args.kg_url,
             spread=args.kg_spread == "on",
             decay=args.kg_decay,
-            extractor_model=args.kg_extract_model,
-            extractor_provider=args.provider,
+            agent_model=args.kg_agent_model,
+            agent_provider=args.kg_agent_provider,
+            max_tool_calls=args.kg_max_tool_calls,
             llm_rpm=args.rpm,
         )
+    elif backend == "none":
+        mem0 = NoMemoryClient(context_tokens=args.none_context_tokens)
     else:
         mem0 = Mem0Client(
             mode=backend,
@@ -962,6 +972,9 @@ async def async_main() -> None:
         with shutdown:
             tasks = [process_conversation(idx) for idx in conv_indices]
             await asyncio.gather(*tasks)
+
+    if hasattr(mem0, "ingest_metadata"):
+        kg_meta.update(mem0.ingest_metadata())
 
     # --- Metrics ---
     if not args.predict_only and all_evaluations:

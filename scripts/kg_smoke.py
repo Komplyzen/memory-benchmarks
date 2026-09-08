@@ -3,14 +3,20 @@
 KG smoke test
 =============
 
-Against a running Komplyt KG: ingest three fake turns (one dataset session),
-run one read-only search, print what came back, then wipe the project.
+Against a running Komplyt KG: ingest one fake dataset session of three turns,
+run one read-only search twice (ids must match), print what came back, then
+wipe the project.
 
     KG_DB_NAME=bench python -m scripts.kg_smoke [--kg-url http://localhost:3000] [--no-wipe]
+    KG_DB_NAME=bench python -m scripts.kg_smoke --stub-agent     # no LLM: scripted tool calls (CI)
 
-Needs: a KG HTTP server, a token (`kg auth login` or KG_TOKEN), an OpenAI key
-for the extractor, and root SurrealDB env (KG_DB_URL/KG_DB_USER/KG_DB_PASS/
-KG_DB_NS/KG_DB_NAME) for the wipe.
+Default ingest is the MCP agent (needs OPENAI_API_KEY or ANTHROPIC_API_KEY for
+--agent-provider). --stub-agent replaces it with a fixed sequence: session
+start, one kg_query, three kg_node creates (one relates_to), one kg_update,
+session end, all through the same guardrails.
+
+Needs: a KG HTTP server, a token (`kg auth login` or KG_TOKEN), and root
+SurrealDB env (KG_DB_URL/KG_DB_USER/KG_DB_PASS/KG_DB_NS/KG_DB_NAME) for the wipe.
 """
 
 from __future__ import annotations
@@ -22,13 +28,14 @@ import logging
 import time
 import uuid
 
+from benchmarks.common.kg_agent_ingest import ScriptedIngestor
 from benchmarks.common.kg_client import KgClient
 from benchmarks.common.mem0_client import format_search_results
 
 TURNS = [
-    {"role": "user", "name": "Caroline", "content": "I finally booked the trip to Lisbon for the second week of October. Three nights, staying near Alfama."},
-    {"role": "user", "name": "Melanie", "content": "Nice! Are you going alone or with Tom?"},
-    {"role": "user", "name": "Caroline", "content": "With Tom. It's his first time in Portugal, and we decided to skip Porto this time and just do Lisbon properly."},
+    {"role": "user", "content": "Caroline: I finally booked the trip to Lisbon for the second week of October. Three nights, staying near Alfama."},
+    {"role": "assistant", "content": "Melanie: Nice! Are you going alone or with Tom?"},
+    {"role": "user", "content": "Caroline: With Tom. It's his first time in Portugal, and we decided to skip Porto this time and just do Lisbon properly."},
 ]
 
 
@@ -37,6 +44,9 @@ async def main() -> None:
     parser.add_argument("--kg-url", default=None)
     parser.add_argument("--no-wipe", action="store_true")
     parser.add_argument("--no-spread", action="store_true")
+    parser.add_argument("--stub-agent", action="store_true", help="scripted tool calls, no LLM")
+    parser.add_argument("--agent-model", default="gpt-5-mini")
+    parser.add_argument("--agent-provider", default="openai", choices=["openai", "anthropic", "azure", "mistral"])
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
@@ -45,17 +55,30 @@ async def main() -> None:
     user_id = f"smoke_{uuid.uuid4().hex[:8]}"
     session_epoch = 1683547200  # 2023-05-08 12:00 UTC
 
-    async with KgClient(url=args.kg_url, spread=not args.no_spread, decay="on") as kg:
-        print(f"user_id={user_id} project={kg.project_for(user_id)} url={kg.url}")
+    kg = KgClient(
+        url=args.kg_url,
+        spread=not args.no_spread,
+        decay="on",
+        agent_model=args.agent_model,
+        agent_provider=args.agent_provider,
+        ingestor=ScriptedIngestor() if args.stub_agent else None,
+    )
+    async with kg:
+        print(f"user_id={user_id} project={kg.project_for(user_id)} url={kg.url} ingest={kg.ingest_mode}")
+
+        contract = await kg.tool_contract()
+        print(f"tool contract: {len(contract.raw_tools)} tools sha256={contract.sha256[:16]} instructions={len(contract.instructions)} chars")
 
         t0 = time.monotonic()
         added = await kg.add(TURNS, user_id, timestamp=session_epoch)
         print(f"\nADD ({(time.monotonic() - t0) * 1000:.0f} ms):")
         if added is None:
-            print("  add() returned None - check the log above (token? session? extractor?)")
+            print("  add() returned None - check the log above (token? session? agent?)")
             return
         for r in added["results"]:
-            print(f"  {r['id']}  edges={r.get('edges_created', 0)}  {r['memory']}")
+            print(f"  {r['id']}  {r['memory'][:120]}")
+        print(f"  ingest stats: {json.dumps(kg.ingestor.stats.as_metadata())}")
+        print(f"  guardrails:   {json.dumps(kg.guardrails)}")
 
         t0 = time.monotonic()
         raw = await kg.search("Where is Caroline travelling and with whom?", user_id, top_k=10)
@@ -64,9 +87,8 @@ async def main() -> None:
         print(f"  query_debug={json.dumps(query_debug)}")
         for f in formatted:
             dbg = f.get("score_debug", {})
-            print(f"  score={f['score']:.0f} src={dbg.get('activation_source')} combined={dbg.get('combined_score')} decay={dbg.get('decay_score')}  {f['memory']}")
+            print(f"  score={f['score']:.0f} src={dbg.get('activation_source')} combined={dbg.get('combined_score')} decay={dbg.get('decay_score')}  {f['memory'][:120]}")
 
-        # Second search must return the same ids (read_only => no activation drift).
         raw2 = await kg.search("Where is Caroline travelling and with whom?", user_id, top_k=10)
         ids1 = [r["id"] for r in raw["results"]] if isinstance(raw, dict) else []
         ids2 = [r["id"] for r in raw2["results"]] if isinstance(raw2, dict) else []

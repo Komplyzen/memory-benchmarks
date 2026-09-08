@@ -296,8 +296,15 @@ def load_result_json(path: str) -> dict | None:
         return None
 
 
+# Pseudo-cutoff for --backend none: the whole transcript is one memory, so
+# formatted[:FULL_CONTEXT_CUTOFF] keeps it and the label reads "full_context".
+FULL_CONTEXT_CUTOFF = 10**9
+
+
 def cutoff_label(cutoff: int | None) -> str:
     """Convert a cutoff value to a label string."""
+    if cutoff == FULL_CONTEXT_CUTOFF:
+        return "full_context"
     return "all" if cutoff is None else f"top_{cutoff}"
 
 
