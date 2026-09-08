@@ -1,0 +1,48 @@
+{
+  "_comment": "Single source of profile -> models for bench.sh / benchmark.yml (spec-benchmark-ci). Prices are LIST prices per 1M tokens in USD as recorded on prices_recorded_on; verify before quoting. Judge is gpt-5 in every profile so results share one scale.",
+  "profiles": {
+    "cheap": {
+      "answerer_model": "gpt-5-nano",
+      "answerer_provider": "openai",
+      "judge_model": "gpt-5",
+      "judge_provider": "openai",
+      "agent_model": "gpt-5-nano",
+      "agent_provider": "openai",
+      "mem0_llm_model": "gpt-5-nano",
+      "extra_backends": [],
+      "comment": "Direction only: cheapest legs, same judge."
+    },
+    "head-to-head": {
+      "answerer_model": "gpt-5",
+      "answerer_provider": "openai",
+      "judge_model": "gpt-5",
+      "judge_provider": "openai",
+      "agent_model": "gpt-5",
+      "agent_provider": "openai",
+      "mem0_llm_model": "gpt-5",
+      "extra_backends": [],
+      "comment": "Everything gpt-5; comparable to mem0's published Cloud runs in model class."
+    },
+    "small-model": {
+      "answerer_model": "claude-haiku-4-5",
+      "answerer_provider": "anthropic",
+      "judge_model": "gpt-5",
+      "judge_provider": "openai",
+      "agent_model": "claude-haiku-4-5",
+      "agent_provider": "anthropic",
+      "mem0_llm_model": "claude-haiku-4-5",
+      "extra_backends": ["none"],
+      "comment": "Small-model profile: adds the no-memory full-context floor. mem0 OSS's default config is OpenAI-only; running its extraction on claude-haiku-4-5 needs an Anthropic-capable mem0 config (llm.provider: anthropic + ANTHROPIC_API_KEY in the container), see docker/mem0 and configs/."
+    }
+  },
+  "prices_recorded_on": "2026-09-08",
+  "prices_note": "List prices per 1M tokens, USD, as published on the providers' pricing pages on prices_recorded_on. Not verified against invoices. cached_input_per_m_usd null = provider offers no prompt cache discount we can rely on.",
+  "usd_to_eur": 0.87,
+  "prices": {
+    "gpt-5":                {"input_per_m_usd": 1.25, "output_per_m_usd": 10.0, "cached_input_per_m_usd": 0.125},
+    "gpt-5-mini":           {"input_per_m_usd": 0.25, "output_per_m_usd": 2.0,  "cached_input_per_m_usd": 0.025},
+    "gpt-5-nano":           {"input_per_m_usd": 0.05, "output_per_m_usd": 0.40, "cached_input_per_m_usd": 0.005},
+    "claude-haiku-4-5":     {"input_per_m_usd": 1.0,  "output_per_m_usd": 5.0,  "cached_input_per_m_usd": 0.1},
+    "mistral-small-latest": {"input_per_m_usd": 0.10, "output_per_m_usd": 0.30, "cached_input_per_m_usd": null}
+  }
+}

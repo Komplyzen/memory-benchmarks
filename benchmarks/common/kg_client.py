@@ -87,6 +87,11 @@ KG_TOKEN_HINT = (
     "KG returned 401 Unauthorized. Run `kg auth login` (Knowledge-Graph/src/bin/kg.ts) "
     "against staging Komplyt, or set KG_TOKEN."
 )
+# spec-benchmark-ci CAP-3: in CI the token is signed in-job against a local JWKS
+# server, so a 401 means "token or JWKS server", and one retry covers a JWKS
+# that was not yet served when the KG server first fetched it.
+KG_CI_TOKEN_HINT = "KG returned 401 Unauthorized: token or JWKS server (KG_CI mode). Check the in-job signer and the JWKS static server."
+KG_CI = bool(os.getenv("KG_CI"))
 WRITE_TOOLS = frozenset({"kg_node", "kg_record", "kg_relate", "kg_update"})
 
 
@@ -287,7 +292,11 @@ class KgClient:
                 async with self.limiter:
                     async with session.post(f"{self.url}/mcp", json=body) as resp:
                         if resp.status == 401:
-                            raise KgAuthError(KG_TOKEN_HINT)
+                            if KG_CI and attempt == 0:
+                                logger.warning("KG 401 in KG_CI mode; retrying once (token or JWKS server)")
+                                await asyncio.sleep(self.retry_delay)
+                                continue
+                            raise KgAuthError(KG_CI_TOKEN_HINT if KG_CI else KG_TOKEN_HINT)
                         if resp.status == 403:
                             raise KgAuthError(f"KG returned 403: {await resp.text()}")
                         if resp.status == 429:
@@ -693,6 +702,7 @@ class KgClient:
             "tool_contract_sha256": self.tool_contract_sha256,
             "tool_descriptions_truncated_for_openai": list(self._contract.truncated_descriptions) if self._contract else [],
             "kg_guardrails": dict(self.guardrails),
+            "kg_nodes_created": sum(len(v) for v in self._created.values()),
         }
         stats = getattr(self.ingestor, "stats", None)
         if stats is not None:

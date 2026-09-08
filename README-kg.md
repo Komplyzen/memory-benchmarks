@@ -143,6 +143,45 @@ python -m benchmarks.locomo.run --backend oss --project-name mem0-oss-baseline \
 
 `--resume` works as for mem0 (ingest checkpoints are per conversation/question). Because chunks are buffered into whole dataset sessions before the agent runs, a run interrupted mid-session loses that session's buffered turns on resume (the runner's chunk checkpoint considers them done). `kg_query` caps `limit` at 100, so cutoff 200 is not available for the KG; mem0's published Cloud number at `top_200` is cited, not reproduced.
 
+## CI / bench.sh interface
+
+`.github/scripts/bench.sh` in the Knowledge-Graph repo (spec-benchmark-ci) drives these fork-side scripts. Backend names everywhere: `kg-full`, `kg-no-spread`, `kg-no-decay`, `mem0-oss`, `none` (`no-memory` is accepted as an alias and normalized to `none`). Flags per backend live in `benchmarks/common/bench_common.py` (`BACKEND_FLAGS`).
+
+**Profiles and prices** `benchmarks/common/profiles.json`: `cheap` (gpt-5-nano everywhere, judge gpt-5), `head-to-head` (all gpt-5), `small-model` (claude-haiku-4-5 answerer/agent/mem0 extraction, judge gpt-5, adds the `none` leg). `prices` are list prices per 1M tokens (USD) with `prices_recorded_on`; verify before quoting. mem0 OSS's default config is OpenAI-only; the small-model profile's `mem0_llm_model` needs an Anthropic-capable mem0 config.
+
+| Script | Purpose | Exit codes |
+|---|---|---|
+| `scripts/gate_estimate.py --benchmark locomo\|longmemeval --shards CSV\|all [--shard-size 25] --cutoffs CSV --backends CSV --profile NAME [--answerer-model ...] [--dataset-path F] [--expected-sha256 HEX] [--max-questions N] [--full]` | Validate inputs, download + sha256 the dataset (runner's own download function), resolve shards, estimate calls and EUR. **One JSON object on stdout**: `{benchmark, profile, models, cutoffs, backends, shards:[{idx, questions, sessions, dataset_path}], totals:{questions, sessions, calls, eur}, per_backend:{name:{calls, eur}}, dataset_sha256, prices_recorded_on, price_missing, full, ceiling}`. Prose on stderr. For longmemeval `shards[].dataset_path` is the slice file *name* (`longmemeval_s_shard<idx>.json`); `slice_dataset.py` decides the directory. | 2 invalid input (unknown backend named, cutoff > 100 for kg-*, bad shard, unknown profile), 3 sha256 mismatch (both printed), 4 calls > 2500 without `--full` (JSON still printed), 5 `KG_EMBED_FIXTURES` set |
+| `scripts/slice_dataset.py --benchmark longmemeval --shard-size 25 --out-dir DIR [--dataset-path F]` | Writes `longmemeval_s_shard<idx>.json` blocks; prints `[{idx, path, questions}]`. For locomo prints `[]` (shards are conversations). | 2 bad input |
+| `scripts/merge_results.py --benchmark B --backend NAME --expected-shards CSV [--allow-partial] --out FILE --run-id ID --run-attempt N DIR...` | Merge legs of one backend into the runner's unified shape; metrics recomputed with `compute_locomo_metrics` / `compute_longmemeval_metrics`. | 2 zero evaluations, backend mismatch, missing shards (unless `--allow-partial`, then `missing_shards` listed), legs differing in answerer_model / judge_model / cutoffs / harness_sha / kg_variant, duplicate question_id |
+| `scripts/strip_for_publish.py IN OUT [--keep-questions]` | Remove dataset text before publishing: `retrieval.search_results[].memory`, `user_profile`, and (unless `--keep-questions`) `question`, `ground_truth_answer`, `retrieval.search_query`. Ids, scores, `score_debug`, `evidence` (dialog ids), model output kept. | |
+| `scripts/summary_table.py --out SUMMARY.md [--full] [--failed backend:shard:phase ...] MERGED.json...` | Job-summary markdown: header (run id, harness SHA, KG commit, models, cutoffs, provenance lines, dev-loop notice with shards unless `--full`), one row per backend, delta rows vs `mem0-oss`, one line per failed leg. | |
+
+**Leg directory** = the runner's `results/<benchmark>/predicted_<project>/`: per-question `<question_id>.json` files, runner checkpoints prefixed `_`, plus a sidecar **`leg_meta.json`** that bench.sh writes:
+
+```json
+{
+  "backend": "kg-full", "shard": 0,
+  "models": {"answerer_model": "...", "answerer_provider": "...", "judge_model": "...", "judge_provider": "...",
+             "agent_model": "...", "agent_provider": "...", "mem0_llm_model": "..."},
+  "cutoffs": [20, 100],
+  "harness_sha": "<fork commit the leg ran>",
+  "kg_commit": "<KG commit>",
+  "kg_meta": { "...client.ingest_metadata() of the leg (kg-* legs)" },
+  "wall_seconds": 1234.5,
+  "phase_failed": "ingest",
+  "embed_failures": 0,
+  "mem0": {"llm_model": "gpt-5-nano", "search_flags": {"rerank": false, "top_k": 100}, "image_digest": "sha256:..."},
+  "versions": {"docker": "...", "bun": "...", "python": "..."}
+}
+```
+
+Required: `backend`, `shard`, `models`, `cutoffs`, `harness_sha`. Everything else is optional and feeds the summary (wall time, nodes per shard from `kg_meta.kg_nodes_created`, embed failures, mem0 flags). The runner itself writes its unified file to `--output-dir`, not into the predicted directory, so `leg_meta.json` is the only metadata merge reads per leg.
+
+**Merged file** (`<benchmark>_<backend>_results.json`): `{metadata, metrics_by_cutoff, evaluations}` like the runner's own, with metadata adding `backend`, `kg_variant`, `github_run_id`, `run_attempt`, `harness_sha` (git rev-parse HEAD of the fork at merge time; `leg_harness_sha` is what the legs recorded), `kg_commit`, `embedding_model`, `legs: [{shard, dir, evaluations, wall_seconds, phase_failed, kg_ingest_llm_calls, answer_judge_calls, nodes_created, embed_failures}]`, `expected_shards`, `missing_shards`, `wall_seconds_total`, `answer_judge_calls`, summed `kg_ingest_*` counters, `mem0_llm_model`, `mem0_search_flags`, `mem0_image_digest`.
+
+**KG_CI mode.** With `KG_CI=1` the client reports a 401 as "token or JWKS server" and retries once before failing, instead of advising `kg auth login`.
+
 ## Reading results
 
 Results land in `results/locomo/predicted_<project-name>/` and the unified `locomo_results_<ts>.json`. Backend metadata: `memory_backend`, `kg_variant`, `kg_spread`, `kg_decay`, `kg_commit`, `kg_ingest_mode`, `kg_agent_provider`, `kg_agent_model`, `tool_contract_sha256`, `kg_ingest_*` (sessions, LLM calls, prompt/completion/cached tokens, cache hit ratio, tool calls total and by name, tool calls per session, tool calls per LLM call and its histogram, `max_tool_calls_hit`), `kg_guardrails` (how often the harness had to start/end/dedupe sessions or inject the project), `kg_embed_provider`; for `none`: `none_context_token_budget`, `none_questions_truncated`, `none_sessions_dropped_total`. Per-question `retrieval.search_results[].score_debug` carries `combined_score`, `semantic_score`, `decay_score`, `activation`, `activation_source`.
