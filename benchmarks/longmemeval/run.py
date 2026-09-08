@@ -53,6 +53,7 @@ from tqdm import tqdm
 
 from benchmarks.common.llm_client import LLMClient
 from benchmarks.common.mem0_client import Mem0Client, format_search_results
+from benchmarks.common.kg_client import KgClient, build_kg_metadata
 from benchmarks.common.metrics import compute_overall_metrics
 from benchmarks.common.schema import (
     CutoffResult,
@@ -1033,9 +1034,13 @@ def parse_args() -> argparse.Namespace:
         help="Requests per minute for LLM",
     )
     parser.add_argument(
-        "--backend", default="oss", choices=["oss", "cloud"],
-        help="Mem0 backend: 'oss' for self-hosted server (default), 'cloud' for api.mem0.ai",
+        "--backend", default="oss", choices=["oss", "cloud", "kg"],
+        help="Memory backend: 'oss' for self-hosted Mem0 (default), 'cloud' for api.mem0.ai, 'kg' for the Komplyt KG",
     )
+    parser.add_argument("--kg-url", default=None, help="Komplyt KG HTTP server URL (kg backend; default http://localhost:3000)")
+    parser.add_argument("--kg-spread", default="on", choices=["on", "off"], help="kg backend: spreading activation on kg_query")
+    parser.add_argument("--kg-decay", default="on", choices=["on", "off"], help="kg backend: one KG session per dataset session (on) or a single session for the run (off)")
+    parser.add_argument("--kg-extract-model", default="gpt-4o-mini", help="kg backend: extraction model")
     parser.add_argument(
         "--mem0-host", default=None,
         help="Mem0 server URL",
@@ -1055,6 +1060,7 @@ def parse_args() -> argparse.Namespace:
 async def async_main() -> None:
     args = parse_args()
     logger = setup_logging("longmemeval", debug=args.debug)
+    kg_meta = build_kg_metadata(args) if os.getenv("MEM0_BACKEND", args.backend) == "kg" else {}
 
     cutoffs = parse_cutoffs(args.top_k_cutoffs)
     selected_types = (
@@ -1222,6 +1228,7 @@ async def async_main() -> None:
                 "per_type": args.per_type,
                 "seed": args.seed,
                 "evaluate_only": True,
+                **kg_meta,
             },
             "metrics_by_cutoff": metrics,
             "evaluations": all_evaluations,
@@ -1231,12 +1238,27 @@ async def async_main() -> None:
         return
 
     backend = os.getenv("MEM0_BACKEND", args.backend)
-    mem0 = Mem0Client(
-        mode=backend,
-        host=args.mem0_host,
-        api_key=args.mem0_api_key if backend == "cloud" else None,
-        rpm=args.rpm,
-    )
+    if backend == "kg":
+        if args.max_workers != 1:
+            # KG sessions are tenant-global: interleaved ingest would attach
+            # nodes to another question's session and fire extra decay.
+            print("  [kg] forcing --max-workers 1 (KG sessions are tenant-global)")
+            args.max_workers = 1
+        mem0 = KgClient(
+            url=args.kg_url,
+            spread=args.kg_spread == "on",
+            decay=args.kg_decay,
+            extractor_model=args.kg_extract_model,
+            extractor_provider=args.provider,
+            llm_rpm=args.rpm,
+        )
+    else:
+        mem0 = Mem0Client(
+            mode=backend,
+            host=args.mem0_host,
+            api_key=args.mem0_api_key if backend == "cloud" else None,
+            rpm=args.rpm,
+        )
     shutdown = GracefulShutdown()
     checkpoint = Checkpoint(output_dir)
 
@@ -1396,6 +1418,7 @@ async def async_main() -> None:
                     "all_questions": args.all_questions,
                     "per_type": args.per_type,
                     "seed": args.seed,
+                    **kg_meta,
                 },
                 "metrics_by_cutoff": metrics,
                 "evaluations": all_evaluations,

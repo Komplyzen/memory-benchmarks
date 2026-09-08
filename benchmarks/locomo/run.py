@@ -44,6 +44,7 @@ from tqdm import tqdm
 
 from benchmarks.common.llm_client import LLMClient
 from benchmarks.common.mem0_client import Mem0Client, format_search_results
+from benchmarks.common.kg_client import KgClient, build_kg_metadata
 from benchmarks.common.metrics import compute_overall_metrics
 from benchmarks.common.schema import (
     CutoffResult,
@@ -709,8 +710,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--user-profile", action="store_true", help="Fetch user profiles")
     parser.add_argument("--max-questions", type=int, default=None, help="Max questions to process (for quick testing)")
     parser.add_argument("--rpm", type=int, default=200, help="Requests per minute for LLM")
-    parser.add_argument("--backend", default="oss", choices=["oss", "cloud"],
-                        help="Mem0 backend: 'oss' for self-hosted server (default), 'cloud' for api.mem0.ai")
+    parser.add_argument("--backend", default="oss", choices=["oss", "cloud", "kg"],
+                        help="Memory backend: 'oss' for self-hosted Mem0 (default), 'cloud' for api.mem0.ai, 'kg' for the Komplyt KG")
+    parser.add_argument("--kg-url", default=None, help="Komplyt KG HTTP server URL (kg backend; default http://localhost:3000)")
+    parser.add_argument("--kg-spread", default="on", choices=["on", "off"], help="kg backend: spreading activation on kg_query")
+    parser.add_argument("--kg-decay", default="on", choices=["on", "off"], help="kg backend: one KG session per dataset session (on) or a single session for the run (off)")
+    parser.add_argument("--kg-extract-model", default="gpt-4o-mini", help="kg backend: extraction model")
     parser.add_argument("--mem0-host", default=None,
                         help="Mem0 server URL (default: http://localhost:8888 for oss, https://api.mem0.ai for cloud)")
     parser.add_argument("--mem0-api-key", default=None,
@@ -726,6 +731,7 @@ def parse_args() -> argparse.Namespace:
 async def async_main() -> None:
     args = parse_args()
     logger = setup_logging("locomo", debug=args.debug)
+    kg_meta = build_kg_metadata(args) if os.getenv("MEM0_BACKEND", args.backend) == "kg" else {}
 
     cutoffs = parse_cutoffs(args.top_k_cutoffs)
     categories = [int(c) for c in args.categories.split(",")]
@@ -819,6 +825,7 @@ async def async_main() -> None:
                 "total_questions": len(all_evaluations),
                 "categories": categories,
                 "evaluate_only": True,
+                **kg_meta,
             },
             "metrics_by_cutoff": metrics,
             "evaluations": all_evaluations,
@@ -827,14 +834,29 @@ async def async_main() -> None:
         print(f"\nTotal questions evaluated: {len(all_evaluations)}")
         return
 
-    # Init Mem0 (not used for --evaluate-only)
+    # Init memory backend (not used for --evaluate-only)
     backend = os.getenv("MEM0_BACKEND", args.backend)
-    mem0 = Mem0Client(
-        mode=backend,
-        host=args.mem0_host,
-        api_key=args.mem0_api_key if backend == "cloud" else None,
-        rpm=args.rpm,
-    )
+    if backend == "kg":
+        if args.max_workers != 1:
+            # KG sessions are tenant-global: interleaved ingest would attach
+            # nodes to another conversation's session and fire extra decay.
+            print("  [kg] forcing --max-workers 1 (KG sessions are tenant-global)")
+            args.max_workers = 1
+        mem0 = KgClient(
+            url=args.kg_url,
+            spread=args.kg_spread == "on",
+            decay=args.kg_decay,
+            extractor_model=args.kg_extract_model,
+            extractor_provider=args.provider,
+            llm_rpm=args.rpm,
+        )
+    else:
+        mem0 = Mem0Client(
+            mode=backend,
+            host=args.mem0_host,
+            api_key=args.mem0_api_key if backend == "cloud" else None,
+            rpm=args.rpm,
+        )
     shutdown = GracefulShutdown()
     checkpoint = Checkpoint(output_dir)
 
@@ -964,6 +986,7 @@ async def async_main() -> None:
                     "top_k_cutoffs": [cutoff_label(c) for c in cutoffs],
                     "total_questions": len(all_evaluations),
                     "categories": categories,
+                    **kg_meta,
                 },
                 "metrics_by_cutoff": metrics,
                 "evaluations": all_evaluations,
