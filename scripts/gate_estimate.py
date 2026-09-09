@@ -229,8 +229,14 @@ def main() -> int:
 
         profiles = load_profiles()
         backends = normalize_backends(args.backends)
-        cutoffs = normalize_cutoffs(args.cutoffs, backends)
         models = resolve_models(args.profile, {k: getattr(args, k) for k in MODEL_KEYS}, profiles)
+        # Profile-mandated extra legs (e.g. small-model adds the no-memory floor).
+        for extra in profiles["profiles"][args.profile].get("extra_backends") or []:
+            name = normalize_backends(extra)[0]
+            if name not in backends:
+                backends.append(name)
+                log(f"profile {args.profile} adds backend {name}")
+        cutoffs = normalize_cutoffs(args.cutoffs, backends)
 
         dataset_path = resolve_dataset(args.benchmark, args.dataset_path)
         digest = sha256_file(dataset_path)

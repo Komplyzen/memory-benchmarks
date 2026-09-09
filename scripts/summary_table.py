@@ -83,7 +83,8 @@ def main() -> int:
             f"- Harness SHA: `{md0.get('harness_sha')}`",
             f"- KG commit: `{md0.get('kg_commit')}`",
             f"- Models: answerer `{md0.get('answerer_model')}` ({md0.get('answerer_provider')}), judge `{md0.get('judge_model')}` ({md0.get('judge_provider')}), agent `{md0.get('agent_model')}` ({md0.get('agent_provider')}), mem0 extraction `{md0.get('mem0_llm_model')}`",
-            f"- Cutoffs: {', '.join(str(c) for c in (md0.get('cutoffs') or []))} (none backend: full_context)",
+            f"- Cutoffs: {', '.join(str(c) for c in (md0.get('cutoffs') or []))}"
+            + (" (none backend: full_context)" if any("full_context" in (r.get("metrics_by_cutoff") or {}) for r in runs) else ""),
             "- All legs come from this run; no numbers are mixed across runs.",
             "- Each backend embeds with its own provider (KG: its configured embedding provider; mem0: its container config).",
         ]
@@ -103,10 +104,14 @@ def main() -> int:
             groups = sorted(set(groups) | set(g))
         cutoffs = runs[0]["metadata"].get("cutoffs") or []
         labels = [cutoff_label(c) for c in cutoffs]
+        # full_context columns only when a none (no-memory) backend actually ran
+        has_full_context = any("full_context" in (r.get("metrics_by_cutoff") or {}) for r in runs)
+        all_labels = labels + (["full_context"] if has_full_context else [])
+        token_cutoffs = list(zip(labels, cutoffs)) + ([("full_context", FULL_CONTEXT_CUTOFF)] if has_full_context else [])
         cols = ["backend"]
-        for lab in labels + ["full_context"]:
+        for lab in all_labels:
             cols += [f"{g}@{lab}" for g in groups] + [f"overall@{lab}"]
-        cols += [f"tok→ans@{lab}" for lab in labels + ["full_context"]]
+        cols += [f"tok→ans@{lab}" for lab in all_labels]
         cols += ["p50 ms", "p95 ms", "nodes/shard", "embed fail", "wall", "LLM calls", "embedding", "notes"]
         lines.append("| " + " | ".join(cols) + " |")
         lines.append("|" + "---|" * len(cols))
@@ -114,12 +119,12 @@ def main() -> int:
         def row_for(b: str, r: dict[str, Any]) -> list[str]:
             md, mbc, ev = r["metadata"], r.get("metrics_by_cutoff") or {}, r.get("evaluations") or []
             cells = [f"**{b}**"]
-            for lab in labels + ["full_context"]:
+            for lab in all_labels:
                 m = mbc.get(lab) or {}
                 grp = m.get(group_field) or {}
                 cells += [fmt((grp.get(g) or {}).get("accuracy")) for g in groups]
                 cells.append(fmt((m.get("overall") or {}).get("accuracy")))
-            for lab, c in list(zip(labels, cutoffs)) + [("full_context", FULL_CONTEXT_CUTOFF)]:
+            for lab, c in token_cutoffs:
                 cells.append(fmt(tokens_to_answerer(ev, c), 0) if lab in mbc else "–")
             p50, p95 = latency_percentiles(ev)
             cells += [fmt(p50), fmt(p95)]
@@ -154,7 +159,7 @@ def main() -> int:
                     continue
                 km = by_backend[b].get("metrics_by_cutoff") or {}
                 cells = [f"Δ {b} vs mem0-oss (pp)"]
-                for lab in labels + ["full_context"]:
+                for lab in all_labels:
                     for g in groups + ["overall"]:
                         if g == "overall":
                             a, o = (km.get(lab) or {}).get("overall", {}).get("accuracy"), (bm.get(lab) or {}).get("overall", {}).get("accuracy")
