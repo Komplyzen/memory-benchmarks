@@ -55,6 +55,9 @@ USER_HEADER_TEMPLATE = "Session dated {date} between {speaker_a} and {speaker_b}
 OPENAI_COMPATIBLE = {
     "openai": {"base_url": None, "key_env": "OPENAI_API_KEY"},
     "mistral": {"base_url": "https://api.mistral.ai/v1", "key_env": "MISTRAL_API_KEY"},
+    # Any OpenAI-compatible endpoint (vLLM, Parasail, Aleph Alpha, ...): url and key from env,
+    # matching the `openai-compatible` entry in profiles.json's provider registry.
+    "openai-compatible": {"base_url": os.getenv("LLM_BASE_URL"), "key_env": "LLM_API_KEY"},
 }
 
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[str]]

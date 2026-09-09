@@ -45,6 +45,8 @@ from benchmarks.common.bench_common import (
     load_profiles,
     normalize_backends,
     normalize_cutoffs,
+    required_env,
+    resolve_endpoints,
     resolve_models,
     usd_cost,
 )
@@ -258,10 +260,14 @@ def main() -> int:
         total_eur = round(sum(v["eur"] for v in per_backend.values()), 2)
         price_missing = sorted({m for v in per_backend.values() for m in v["price_missing"]})
 
+        endpoints = resolve_endpoints(args.profile, {k: getattr(args, k) for k in MODEL_KEYS}, profiles)
+        env_needed = required_env(endpoints)
         out = {
             "benchmark": args.benchmark,
             "profile": args.profile,
             "models": models,
+            "endpoints": endpoints,
+            "required_env": env_needed,
             "cutoffs": cutoffs,
             "backends": backends,
             "shards": [{k: v for k, v in s.items() if k != "transcript_tokens"} for s in shards],
@@ -282,6 +288,8 @@ def main() -> int:
         log(f"gate: {args.benchmark} profile={args.profile} shards={[s['idx'] for s in shards]} backends={backends} cutoffs={cutoffs}")
         log(f"gate: models answerer={models['answerer_model']}/{models['answerer_provider']} judge={models['judge_model']}/{models['judge_provider']} "
             f"agent={models['agent_model']}/{models['agent_provider']} mem0_llm={models['mem0_llm_model']}")
+        log(f"gate: required env for these endpoints: {', '.join(env_needed)}"
+            + (f"  (unset here: {', '.join(n for n in env_needed if not os.getenv(n))})" if any(not os.getenv(n) for n in env_needed) else ""))
         for b, v in per_backend.items():
             log(f"gate:   {b:<13} calls={v['calls']:>6} (ingest {v['ingest_calls']}, answer+judge {v['qa_calls']})  ~EUR {v['eur']:.2f}")
         log(f"gate: total calls={total_calls} ~EUR {total_eur:.2f} (list prices recorded {profiles.get('prices_recorded_on')}, verify) dataset sha256={digest[:16]}...")

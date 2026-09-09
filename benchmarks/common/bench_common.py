@@ -124,16 +124,60 @@ MODEL_KEYS = ("answerer_model", "answerer_provider", "judge_model", "judge_provi
               "agent_model", "agent_provider", "mem0_llm_model")
 
 
-def resolve_models(profile_name: str, overrides: dict[str, str | None], profiles: dict[str, Any] | None = None) -> dict[str, str]:
+ROLES = ("answerer", "judge", "agent", "mem0")
+
+# Flat key -> (role, field). The runners take flat flags; the profile stores endpoint configs.
+_FLAT_TO_ROLE = {
+    "answerer_model": ("answerer", "model"), "answerer_provider": ("answerer", "provider"),
+    "judge_model": ("judge", "model"), "judge_provider": ("judge", "provider"),
+    "agent_model": ("agent", "model"), "agent_provider": ("agent", "provider"),
+    "mem0_llm_model": ("mem0", "model"),
+}
+
+
+def resolve_endpoints(profile_name: str, overrides: dict[str, str | None],
+                      profiles: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+    """Per-role endpoint configs, mirroring Komplyt's ModelEndpointConfig.
+
+    Each role resolves to {provider, kind, model, base_url, api_key_env, extra_env}. The provider
+    registry in profiles.json is the only place that knows which env var holds which key; the
+    scripts read `required_env` from the gate and never name a provider themselves.
+    """
     profiles = profiles or load_profiles()
     if profile_name not in profiles["profiles"]:
         raise BenchError(f"unknown profile {profile_name!r}; valid: {', '.join(profiles['profiles'])}", 2)
     prof = profiles["profiles"][profile_name]
-    models = {k: prof[k] for k in MODEL_KEYS}
-    for k, v in overrides.items():
-        if v:
-            models[k] = v
-    return models
+    registry = profiles.get("providers") or {}
+    endpoints = {role: dict(prof["endpoints"][role]) for role in ROLES}
+    for flat, value in overrides.items():
+        if value and flat in _FLAT_TO_ROLE:
+            role, field = _FLAT_TO_ROLE[flat]
+            endpoints[role][field] = value
+    for role, ep in endpoints.items():
+        reg = registry.get(ep["provider"])
+        if reg is None:
+            raise BenchError(f"{role}: unknown provider {ep['provider']!r}; registered: {', '.join(registry)}", 2)
+        ep["kind"] = reg["kind"]
+        ep["api_key_env"] = reg["api_key_env"]
+        ep["base_url"] = ep.get("base_url") or reg.get("base_url")
+        ep["base_url_env"] = reg.get("base_url_env")
+        ep["extra_env"] = list(reg.get("extra_env") or [])
+    return endpoints
+
+
+def required_env(endpoints: dict[str, dict[str, Any]]) -> list[str]:
+    names: list[str] = []
+    for ep in endpoints.values():
+        for n in [ep["api_key_env"], *ep.get("extra_env", [])] + ([ep["base_url_env"]] if ep.get("base_url_env") else []):
+            if n and n not in names:
+                names.append(n)
+    return names
+
+
+def resolve_models(profile_name: str, overrides: dict[str, str | None], profiles: dict[str, Any] | None = None) -> dict[str, str]:
+    """Flat model/provider keys the runners' CLI flags take, derived from the endpoint configs."""
+    endpoints = resolve_endpoints(profile_name, overrides, profiles)
+    return {flat: endpoints[role][field] for flat, (role, field) in _FLAT_TO_ROLE.items()}
 
 
 def price_for(model: str, profiles: dict[str, Any]) -> dict[str, float | None] | None:
