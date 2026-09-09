@@ -51,7 +51,9 @@ from benchmarks.common.bench_common import (
     usd_cost,
 )
 
-CALL_CEILING = 2500
+# The spend guard is a budget in EUR (--budget-eur), not a call ceiling: exit 4 when the forecast
+# is above it. bench.sh then asks a person (or honours --yes). Nothing is spent by this script.
+DEFAULT_BUDGET_EUR = 5.0
 
 AGENT_CALLS_PER_SESSION = 4
 AGENT_IN, AGENT_CACHEABLE, AGENT_OUT = 7000, 4000, 300
@@ -219,7 +221,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset-path", default=None, help="local dataset file; downloaded with the runner's function if omitted")
     p.add_argument("--expected-sha256", default=None, help="exit 3 if the dataset file's sha256 differs")
     p.add_argument("--max-questions", type=int, default=None, help="cap questions per shard in the estimate")
-    p.add_argument("--full", action="store_true", help="allow estimates above the call ceiling")
+    p.add_argument("--budget-eur", type=float, default=DEFAULT_BUDGET_EUR,
+                   help="spend limit for this run in EUR; forecast above it -> exit 4 (bench.sh asks for approval)")
     return p.parse_args()
 
 
@@ -252,8 +255,12 @@ def main() -> int:
             shards = locomo_shards(data, args.shards, args.max_questions)
             for s in shards:
                 s["dataset_path"] = dataset_path
+            all_shards = len(data)
         else:
             shards = longmemeval_shards(data, args.shards, args.shard_size, args.max_questions)
+            all_shards = math.ceil(len(data) / args.shard_size)
+        # "complete" = every shard of the dataset, no question cap: a fact, not a flag.
+        complete = len(shards) == all_shards and not args.max_questions
 
         per_backend = {b: estimate_backend(b, shards, cutoffs, models, profiles, args.benchmark) for b in backends}
         total_calls = sum(v["calls"] for v in per_backend.values())
@@ -281,8 +288,9 @@ def main() -> int:
             "dataset_sha256": digest,
             "prices_recorded_on": profiles.get("prices_recorded_on"),
             "price_missing": price_missing,
-            "full": bool(args.full),
-            "ceiling": CALL_CEILING,
+            "budget_eur": args.budget_eur,
+            "over_budget": total_eur > args.budget_eur,
+            "complete": complete,
         }
 
         log(f"gate: {args.benchmark} profile={args.profile} shards={[s['idx'] for s in shards]} backends={backends} cutoffs={cutoffs}")
@@ -298,8 +306,8 @@ def main() -> int:
 
         print(json.dumps(out))
 
-        if total_calls > CALL_CEILING and not args.full:
-            log(f"gate: REFUSED estimate {total_calls} calls > {CALL_CEILING}; pass --full to run anyway")
+        if total_eur > args.budget_eur:
+            log(f"gate: forecast EUR {total_eur:.2f} is above the budget of EUR {args.budget_eur:.2f} ({total_calls} calls); approval needed")
             return 4
         return 0
     except BenchError as exc:
