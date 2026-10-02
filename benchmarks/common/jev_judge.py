@@ -40,8 +40,10 @@ JEV_CRITERIA_TRUE = (
     "The generated answer contains at least one correct item from the gold answer (partial credit "
     "counts), or expresses the same concept in different words, or identifies the same named "
     "entity, or adds extra detail on top of the gold facts. Dates within 14 days, and durations "
-    "within 50%, match; a relative date matches a specific date in the same window. Emotions in the "
-    "same positive or negative family about the same event match."
+    "within 50%, match; a relative date matches a specific date in the same window; a specific date "
+    "consistent with a vague reference (for example February 2020 for 'a few years ago' relative to "
+    "2023) matches; converting 'last year' to the actual year matches. Emotions in the same positive "
+    "or negative family about the same event match."
 )
 JEV_CRITERIA_FALSE = (
     "The generated answer contains none of the gold answer's items, addresses a different topic, "
@@ -124,15 +126,30 @@ class JevJudge:
         assert self._session is not None, "use JevJudge as an async context manager"
         payload = build_request(category, question, gold, generated)
         last = ""
-        async with self._sem:
-            for attempt in range(self._max_retries):
-                async with self._session.post(JEV_URL, json=payload) as resp:
-                    text = await resp.text()
-                    if resp.status == 200:
-                        return parse_response(json.loads(text), self._threshold)
-                    last = f"HTTP {resp.status}: {text[:200]}"
-                    if resp.status not in (429, 529) and resp.status < 500:
-                        raise JevError(last)  # a 4xx other than rate limiting will not fix itself
-                logger.warning("Jev attempt %d/%d failed: %s", attempt + 1, self._max_retries, last)
+        for attempt in range(self._max_retries):
+            # The semaphore bounds in-flight requests only; backoff sleeps happen outside it.
+            async with self._sem:
+                try:
+                    async with self._session.post(JEV_URL, json=payload) as resp:
+                        text = await resp.text()
+                        status = resp.status
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    status, text = None, f"{type(exc).__name__}: {exc}"
+            if status == 200:
+                try:
+                    body = json.loads(text)
+                except ValueError as exc:
+                    last = f"HTTP 200 with non-JSON body: {text[:200]}"
+                    logger.warning("Jev attempt %d/%d failed: %s", attempt + 1, self._max_retries, last)
+                    if attempt + 1 == self._max_retries:
+                        raise JevError(last) from exc
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                return parse_response(body, self._threshold)
+            last = f"HTTP {status}: {text[:200]}" if status is not None else text
+            if status is not None and status not in (429, 529) and status < 500:
+                raise JevError(last)  # a 4xx other than rate limiting will not fix itself
+            logger.warning("Jev attempt %d/%d failed: %s", attempt + 1, self._max_retries, last)
+            if attempt + 1 < self._max_retries:
                 await asyncio.sleep(2 ** attempt)
         raise JevError(f"gave up after {self._max_retries} attempts; last: {last}")
