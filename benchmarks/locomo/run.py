@@ -484,7 +484,10 @@ async def process_question(
             label_val = raw.get("label", "").upper()
             correct = label_val == "CORRECT"
         else:
+            label_val = ""
             correct = False
+        # Recorded so downstream tools can tell a failed judge call from a genuine WRONG verdict.
+        judge_failed = label_val not in ("CORRECT", "WRONG")
 
         score = 1.0 if correct else 0.0
         judgment = "CORRECT" if correct else "WRONG"
@@ -495,6 +498,7 @@ async def process_question(
             "generated_answer": generated_answer,
             "memories_evaluated": len(sliced),
             "reason": raw.get("reasoning", "") if isinstance(raw, dict) else "",
+            "judge_failed": judge_failed,
         }
 
     result["cutoff_results"] = cutoff_results
@@ -555,7 +559,10 @@ async def apply_locomo_judge_to_saved_result(
             label_val = raw.get("label", "").upper()
             correct = label_val == "CORRECT"
         else:
+            label_val = ""
             correct = False
+        # Recorded so downstream tools can tell a failed judge call from a genuine WRONG verdict.
+        judge_failed = label_val not in ("CORRECT", "WRONG")
 
         score = 1.0 if correct else 0.0
         judgment = "CORRECT" if correct else "WRONG"
@@ -566,6 +573,7 @@ async def apply_locomo_judge_to_saved_result(
             "generated_answer": generated_answer,
             "memories_evaluated": len(sliced),
             "reason": raw.get("reasoning", "") if isinstance(raw, dict) else "",
+            "judge_failed": judge_failed,
         }
 
     result["cutoff_results"] = cutoff_results

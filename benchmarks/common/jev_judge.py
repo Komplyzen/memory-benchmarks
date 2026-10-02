@@ -17,7 +17,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
+import random
 from dataclasses import dataclass
 from typing import Any
 
@@ -63,6 +65,15 @@ class JevError(RuntimeError):
     """The API gave no usable answer after retries (status, request id and body in the message)."""
 
 
+class JevCircuitOpen(JevError):
+    """Too many consecutive failed judgments; further calls are refused without hitting the API."""
+
+
+# Statuses worth retrying: timeouts, rate limits, overload, server errors. Any other 4xx is permanent.
+RETRYABLE_STATUS = frozenset({408, 425, 429, 529})
+MAX_BACKOFF_S = 60.0
+
+
 def build_request(category: int, question: str, gold: str, generated: str) -> dict[str, Any]:
     """The request body for one verdict. Pure, so --dry-run can print it with no API key."""
     return {
@@ -82,32 +93,58 @@ def build_request(category: int, question: str, gold: str, generated: str) -> di
     }
 
 
-def parse_response(body: dict[str, Any], threshold: float = 0.5) -> JevVerdict:
-    """Extract the Noul probability. Raises JevError when the expected answer is missing."""
+def _tokens(usage: Any, key: str) -> int:
+    """Token counts are informational: anything that is not a non-negative int counts as 0."""
+    v = usage.get(key) if isinstance(usage, dict) else None
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+
+
+def parse_response(body: Any, threshold: float = 0.5) -> JevVerdict:
+    """Extract the Noul probability. Raises JevError for any body that is not a usable verdict."""
     try:
         p_yes = float(body["answers"][QUESTION_KEY]["noul"])
     except (KeyError, TypeError, ValueError) as exc:
-        raise JevError(f"unexpected Jev response shape: {json.dumps(body)[:300]}") from exc
-    usage = body.get("usage") or {}
+        raise JevError(f"unexpected Jev response shape: {json.dumps(body, default=str)[:300]}") from exc
+    if not math.isfinite(p_yes) or not 0.0 <= p_yes <= 1.0:
+        raise JevError(f"Jev probability out of range: {p_yes!r}")
+    usage = body.get("usage")
     return JevVerdict(
         correct=p_yes > threshold,
         p_yes=p_yes,
-        input_tokens=int(usage.get("input_tokens", 0)),
-        output_tokens=int(usage.get("output_tokens", 0)),
+        input_tokens=_tokens(usage, "input_tokens"),
+        output_tokens=_tokens(usage, "output_tokens"),
     )
 
 
+def backoff_delay(attempt: int, retry_after: str | None = None, rng: random.Random | None = None) -> float:
+    """Seconds to wait before retry ``attempt + 1``: Retry-After when given, else full jitter on 2**attempt."""
+    if retry_after:
+        try:
+            return min(max(float(retry_after), 0.0), MAX_BACKOFF_S)
+        except ValueError:
+            pass  # an HTTP-date Retry-After is not supported; fall back to jitter
+    return (rng or random).uniform(0.0, min(2.0 ** attempt, MAX_BACKOFF_S))
+
+
 class JevJudge:
-    """Async Jev client for one judging role. Use as ``async with JevJudge(...) as judge``."""
+    """Async Jev client for one judging role. Use as ``async with JevJudge(...) as judge``.
+
+    A request that times out may still have been processed and billed, so retries after a timeout
+    can pay twice; ``breaker`` bounds the damage by refusing calls after that many consecutive
+    judgments that exhausted their retries (or hit a permanent error such as a bad key).
+    """
 
     def __init__(self, api_key: str | None = None, *, threshold: float = 0.5,
-                 concurrency: int = 8, max_retries: int = 5, timeout_s: float = 30.0) -> None:
+                 concurrency: int = 8, max_retries: int = 5, timeout_s: float = 30.0,
+                 breaker: int = 10) -> None:
         self._api_key = api_key or os.environ.get("TYPESAFE_API_KEY", "")
         if not self._api_key:
             raise JevError("TYPESAFE_API_KEY is not set")
         self._threshold = threshold
         self._sem = asyncio.Semaphore(concurrency)
         self._max_retries = max_retries
+        self._breaker = breaker
+        self._consecutive_failures = 0
         self._timeout = aiohttp.ClientTimeout(total=timeout_s)
         self._session: aiohttp.ClientSession | None = None
 
@@ -123,33 +160,41 @@ class JevJudge:
             await self._session.close()
 
     async def judge(self, category: int, question: str, gold: str, generated: str) -> JevVerdict:
+        if self._consecutive_failures >= self._breaker:
+            raise JevCircuitOpen(f"{self._consecutive_failures} consecutive judgments failed; not calling Jev")
+        try:
+            verdict = await self._judge(category, question, gold, generated)
+        except JevError:
+            self._consecutive_failures += 1
+            raise
+        self._consecutive_failures = 0
+        return verdict
+
+    async def _judge(self, category: int, question: str, gold: str, generated: str) -> JevVerdict:
         assert self._session is not None, "use JevJudge as an async context manager"
         payload = build_request(category, question, gold, generated)
         last = ""
         for attempt in range(self._max_retries):
+            retry_after: str | None = None
             # The semaphore bounds in-flight requests only; backoff sleeps happen outside it.
             async with self._sem:
                 try:
                     async with self._session.post(JEV_URL, json=payload) as resp:
-                        text = await resp.text()
                         status = resp.status
-                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                        retry_after = (getattr(resp, "headers", None) or {}).get("Retry-After")
+                        text = await resp.text()
+                except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeDecodeError) as exc:
                     status, text = None, f"{type(exc).__name__}: {exc}"
             if status == 200:
                 try:
-                    body = json.loads(text)
-                except ValueError as exc:
+                    return parse_response(json.loads(text), self._threshold)
+                except ValueError:  # json.loads failure; a JevError from parse_response is permanent
                     last = f"HTTP 200 with non-JSON body: {text[:200]}"
-                    logger.warning("Jev attempt %d/%d failed: %s", attempt + 1, self._max_retries, last)
-                    if attempt + 1 == self._max_retries:
-                        raise JevError(last) from exc
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                return parse_response(body, self._threshold)
-            last = f"HTTP {status}: {text[:200]}" if status is not None else text
-            if status is not None and status not in (429, 529) and status < 500:
-                raise JevError(last)  # a 4xx other than rate limiting will not fix itself
+            else:
+                last = f"HTTP {status}: {text[:200]}" if status is not None else text
+                if status is not None and status not in RETRYABLE_STATUS and status < 500:
+                    raise JevError(last)  # a 4xx other than the retryable ones will not fix itself
             logger.warning("Jev attempt %d/%d failed: %s", attempt + 1, self._max_retries, last)
             if attempt + 1 < self._max_retries:
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep(backoff_delay(attempt, retry_after))
         raise JevError(f"gave up after {self._max_retries} attempts; last: {last}")
