@@ -10,6 +10,7 @@ import asyncio
 import json
 import math
 import random
+import ssl
 import tempfile
 import unittest
 from pathlib import Path
@@ -237,32 +238,68 @@ class JevJudgeRetryTest(unittest.TestCase):
         self.assertTrue(all(0 <= backoff_delay(4, None, rng) <= 16 for _ in range(20)))
         self.assertEqual(backoff_delay(0, "not-a-number", random.Random(1)), backoff_delay(0, None, random.Random(1)))
 
-    def test_circuit_opens_after_consecutive_failures_and_closes_on_success(self) -> None:
-        j, sess = _judge_with([(500, "x")] * 2 + [(200, OK_BODY)] + [(500, "x")] * 2, retries=1, breaker=2)
+    def test_burst_of_concurrent_judgments_is_stopped_by_the_breaker(self) -> None:
+        # 20 judgments started at once (as judge_all does), every request fails: the API must see
+        # about `breaker` requests, not 20 x max_retries.
+        j, sess = _judge_with([(500, "x")] * 200, retries=5, breaker=4, concurrency=4)
+
+        async def go() -> list:
+            res = await asyncio.gather(*(j.judge(1, "q", "g", "a") for _ in range(20)), return_exceptions=True)
+            return [type(r).__name__ for r in res]
+
+        with mock.patch.object(jev_judge.asyncio, "sleep", new=mock.AsyncMock()):
+            names = asyncio.run(go())
+        self.assertLessEqual(sess.calls, 4 + 4)  # breaker + requests already past the check when it opened
+        self.assertIn("JevCircuitOpen", names)
+        self.assertTrue(all(n in ("JevError", "JevCircuitOpen") for n in names))
+
+    def test_breaker_resets_on_success_and_ignores_rate_limiting(self) -> None:
+        j, sess = _judge_with([(500, "x"), (200, OK_BODY), (500, "x"), (200, OK_BODY), (429, "slow"), (429, "slow"), (429, "slow"), (200, OK_BODY)],
+                              retries=2, breaker=2)
+
         async def go() -> list:
             out = []
-            for _ in range(5):
+            for _ in range(4):
                 try:
                     out.append((await j.judge(1, "q", "g", "a")).correct)
+                except JevError:
+                    out.append("fail")
+            return out
+
+        with mock.patch.object(jev_judge.asyncio, "sleep", new=mock.AsyncMock()):
+            self.assertEqual(asyncio.run(go()), [True, True, "fail", True])  # q3: two 429s are not breaker failures
+
+    def test_certificate_error_is_permanent_and_not_retried(self) -> None:
+        err = aiohttp.ClientConnectorCertificateError(
+            mock.Mock(host="api.typesafe.ai", port=443, is_ssl=True, ssl=True), ssl.SSLCertVerificationError("bad"))
+        with self.assertRaises(JevError) as cm:
+            self.run_judge([err, (200, OK_BODY)])
+        self.assertEqual(cm.exception.sess.calls, 1)  # type: ignore[attr-defined]
+        self.assertIn("ClientConnectorCertificateError", str(cm.exception))
+
+    def test_bad_shape_200_counts_towards_the_breaker(self) -> None:
+        j, _ = _judge_with([(200, json.dumps({"answers": {}}))] * 3, retries=1, breaker=2)
+
+        async def go() -> list:
+            out = []
+            for _ in range(3):
+                try:
+                    await j.judge(1, "q", "g", "a")
                 except JevCircuitOpen:
                     out.append("open")
                 except JevError:
                     out.append("fail")
             return out
-        with mock.patch.object(jev_judge.asyncio, "sleep", new=mock.AsyncMock()):
-            self.assertEqual(asyncio.run(go()), ["fail", "fail", "open", "open", "open"])
-        self.assertEqual(sess.calls, 2)  # once open, the API is not called again
 
-        j2, sess2 = _judge_with([(500, "x"), (200, OK_BODY), (500, "x"), (200, OK_BODY)], retries=1, breaker=2)
-        async def alternate() -> list:
-            out = []
-            for _ in range(4):
-                try:
-                    out.append((await j2.judge(1, "q", "g", "a")).correct)
-                except JevError:
-                    out.append("fail")
-            return out
-        self.assertEqual(asyncio.run(alternate()), ["fail", True, "fail", True])  # a success resets the count
+        self.assertEqual(asyncio.run(go()), ["fail", "fail", "open"])
+
+    def test_real_session_is_created_with_a_tls_context_and_closed(self) -> None:
+        async def go() -> bool:
+            async with JevJudge(api_key="k") as j:
+                assert j._session is not None
+                return not j._session.closed and j._session.connector is not None
+        self.assertTrue(asyncio.run(go()))
+        self.assertIsInstance(jev_judge._ssl_context(), ssl.SSLContext)
 
     def test_criteria_keep_the_date_rules_from_the_original_prompt(self) -> None:
         for phrase in ("14 days", "50%", "vague reference", "'last year'"):

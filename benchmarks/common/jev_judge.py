@@ -20,6 +20,7 @@ import logging
 import math
 import os
 import random
+import ssl
 from dataclasses import dataclass
 from typing import Any
 
@@ -67,6 +68,21 @@ class JevError(RuntimeError):
 
 class JevCircuitOpen(JevError):
     """Too many consecutive failed judgments; further calls are refused without hitting the API."""
+
+
+# Failures that are never worth retrying: the next attempt will fail the same way.
+PERMANENT_ERRORS = (aiohttp.ClientConnectorCertificateError,)
+# Rate limiting is expected and handled by backoff; it must not trip the circuit breaker.
+NOT_BREAKER_STATUS = frozenset({429, 529})
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """certifi's CA bundle when available: python.org builds on macOS ship without system roots."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
 
 
 # Statuses worth retrying: timeouts, rate limits, overload, server errors. Any other 4xx is permanent.
@@ -130,8 +146,10 @@ class JevJudge:
     """Async Jev client for one judging role. Use as ``async with JevJudge(...) as judge``.
 
     A request that times out may still have been processed and billed, so retries after a timeout
-    can pay twice; ``breaker`` bounds the damage by refusing calls after that many consecutive
-    judgments that exhausted their retries (or hit a permanent error such as a bad key).
+    can pay twice. ``breaker`` bounds the damage: after that many consecutive failed attempts
+    (transport errors, 5xx, permanent errors such as a bad key or certificate; rate limiting does
+    not count) no further request is sent, whichever judgment it belongs to. It is checked before
+    every attempt, so it also stops a burst of judgments that were all started at once.
     """
 
     def __init__(self, api_key: str | None = None, *, threshold: float = 0.5,
@@ -144,13 +162,14 @@ class JevJudge:
         self._sem = asyncio.Semaphore(concurrency)
         self._max_retries = max_retries
         self._breaker = breaker
-        self._consecutive_failures = 0
+        self._consecutive_failures = 0  # failed attempts in a row, across all judgments
         self._timeout = aiohttp.ClientTimeout(total=timeout_s)
         self._session: aiohttp.ClientSession | None = None
 
     async def __aenter__(self) -> "JevJudge":
         self._session = aiohttp.ClientSession(
             timeout=self._timeout,
+            connector=aiohttp.TCPConnector(ssl=_ssl_context()),
             headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
         )
         return self
@@ -159,39 +178,48 @@ class JevJudge:
         if self._session is not None:
             await self._session.close()
 
-    async def judge(self, category: int, question: str, gold: str, generated: str) -> JevVerdict:
-        if self._consecutive_failures >= self._breaker:
-            raise JevCircuitOpen(f"{self._consecutive_failures} consecutive judgments failed; not calling Jev")
-        try:
-            verdict = await self._judge(category, question, gold, generated)
-        except JevError:
+    def _record_failure(self, status: int | None) -> None:
+        if status not in NOT_BREAKER_STATUS:
             self._consecutive_failures += 1
-            raise
-        self._consecutive_failures = 0
-        return verdict
 
-    async def _judge(self, category: int, question: str, gold: str, generated: str) -> JevVerdict:
+    async def judge(self, category: int, question: str, gold: str, generated: str) -> JevVerdict:
         assert self._session is not None, "use JevJudge as an async context manager"
         payload = build_request(category, question, gold, generated)
         last = ""
         for attempt in range(self._max_retries):
+            if self._consecutive_failures >= self._breaker:
+                raise JevCircuitOpen(f"{self._consecutive_failures} consecutive Jev requests failed; not calling Jev"
+                                     + (f" (last: {last})" if last else ""))
             retry_after: str | None = None
             # The semaphore bounds in-flight requests only; backoff sleeps happen outside it.
             async with self._sem:
+                if self._consecutive_failures >= self._breaker:  # opened while this call waited for a slot
+                    raise JevCircuitOpen(f"{self._consecutive_failures} consecutive Jev requests failed; not calling Jev")
                 try:
                     async with self._session.post(JEV_URL, json=payload) as resp:
                         status = resp.status
                         retry_after = (getattr(resp, "headers", None) or {}).get("Retry-After")
                         text = await resp.text()
+                except PERMANENT_ERRORS as exc:
+                    self._record_failure(None)
+                    raise JevError(f"{type(exc).__name__}: {exc}") from exc
                 except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeDecodeError) as exc:
                     status, text = None, f"{type(exc).__name__}: {exc}"
             if status == 200:
                 try:
-                    return parse_response(json.loads(text), self._threshold)
-                except ValueError:  # json.loads failure; a JevError from parse_response is permanent
+                    verdict = parse_response(json.loads(text), self._threshold)
+                except JevError:  # a 200 that is not a usable verdict will not fix itself
+                    self._record_failure(status)
+                    raise
+                except ValueError:  # json.loads failure
                     last = f"HTTP 200 with non-JSON body: {text[:200]}"
+                    self._record_failure(status)
+                else:
+                    self._consecutive_failures = 0
+                    return verdict
             else:
                 last = f"HTTP {status}: {text[:200]}" if status is not None else text
+                self._record_failure(status)
                 if status is not None and status not in RETRYABLE_STATUS and status < 500:
                     raise JevError(last)  # a 4xx other than the retryable ones will not fix itself
             logger.warning("Jev attempt %d/%d failed: %s", attempt + 1, self._max_retries, last)
