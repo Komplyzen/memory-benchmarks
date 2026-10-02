@@ -42,6 +42,7 @@ from typing import Any
 from dotenv import load_dotenv
 from tqdm import tqdm
 
+from benchmarks.common.concurrency import gather_bounded
 from benchmarks.common.llm_client import LLMClient
 from benchmarks.common.mem0_client import Mem0Client, format_search_results
 from benchmarks.common.kg_client import KgClient, build_backend_metadata
@@ -712,6 +713,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--user-profile", action="store_true", help="Fetch user profiles")
     parser.add_argument("--max-questions", type=int, default=None, help="Max questions to process (for quick testing)")
     parser.add_argument("--rpm", type=int, default=200, help="Requests per minute for LLM")
+    parser.add_argument(
+        "--question-workers", type=lambda v: max(1, int(v)), default=1,
+        help="Questions processed concurrently within a conversation (default 1 = sequential). "
+             "LLM calls are still bounded by --rpm.",
+    )
     parser.add_argument("--backend", default="oss", choices=["oss", "cloud", "kg", "none"],
                         help="Memory backend: 'oss' for self-hosted Mem0 (default), 'cloud' for api.mem0.ai, 'kg' for the Komplyt KG, 'none' for the full-context floor (no memory system)")
     parser.add_argument("--kg-url", default=None, help="Komplyt KG HTTP server URL (kg backend; default http://localhost:3000)")
@@ -931,42 +937,56 @@ async def async_main() -> None:
             if args.max_questions is not None:
                 conv_questions = conv_questions[:args.max_questions]
 
-            search_pbar = tqdm(conv_questions, desc=f"Questions conv {conv_idx}", leave=True)
-            for qi, qa in search_pbar:
+            search_pbar = tqdm(total=len(conv_questions), desc=f"Questions conv {conv_idx}", leave=True)
+
+            async def do_question(qi: int, qa: dict) -> None:
                 qid = f"conv{conv_idx}_q{qi}"
+                try:
+                    if shutdown.requested:
+                        return
 
-                if shutdown.requested:
-                    break
+                    # Skip if already done
+                    async with results_lock:
+                        if qid in existing_ids:
+                            return
 
-                # Skip if already done
-                async with results_lock:
-                    if qid in existing_ids:
-                        continue
+                    result = await process_question(
+                        qa=qa,
+                        qa_idx=qi,
+                        conv_idx=conv_idx,
+                        user_id=user_id,
+                        mem0=mem0,
+                        answerer=answerer,
+                        judge_llm=judge_llm,
+                        cutoffs=cutoffs,
+                        top_k=args.top_k,
+                        reference_date_human=ref_date_human,
+                        user_profile=user_profile,
+                        evidence_lookup=evidence_lookup,
+                        predict_only=args.predict_only,
+                        logger=logger,
+                        score_debug=args.score_debug,
+                    )
 
-                result = await process_question(
-                    qa=qa,
-                    qa_idx=qi,
-                    conv_idx=conv_idx,
-                    user_id=user_id,
-                    mem0=mem0,
-                    answerer=answerer,
-                    judge_llm=judge_llm,
-                    cutoffs=cutoffs,
-                    top_k=args.top_k,
-                    reference_date_human=ref_date_human,
-                    user_profile=user_profile,
-                    evidence_lookup=evidence_lookup,
-                    predict_only=args.predict_only,
-                    logger=logger,
-                    score_debug=args.score_debug,
+                    # Save per-question result
+                    result_path = os.path.join(output_dir, f"{qid}.json")
+                    save_result_json(result_path, result)
+                    async with results_lock:
+                        all_evaluations.append(result)
+                        existing_ids.add(qid)
+                finally:
+                    search_pbar.update(1)
+
+            # Questions are independent (retrieval is read-only), so up to --question-workers run at
+            # once; with 1 this is the original strictly sequential loop. LLM calls stay bounded by
+            # the shared --rpm limiter.
+            try:
+                await gather_bounded(
+                    [lambda qi=qi, qa=qa: do_question(qi, qa) for qi, qa in conv_questions],
+                    args.question_workers,
                 )
-
-                # Save per-question result
-                result_path = os.path.join(output_dir, f"{qid}.json")
-                save_result_json(result_path, result)
-                async with results_lock:
-                    all_evaluations.append(result)
-                    existing_ids.add(qid)
+            finally:
+                search_pbar.close()
 
     async with mem0:
         with shutdown:
