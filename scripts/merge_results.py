@@ -84,7 +84,7 @@ def leg_summary(leg: dict[str, Any]) -> dict[str, Any]:
         "kg_commit": meta.get("kg_commit") or kg_meta.get("kg_commit"),
         "kg_ingest_llm_calls": kg_meta.get("kg_ingest_llm_calls"),
         "answer_judge_calls": answer_judge_calls(leg["evaluations"]),
-        "nodes_created": kg_meta.get("kg_nodes_created") or (kg_meta.get("kg_ingest_tool_calls_by_name") or {}).get("kg_node"),
+        "nodes_created": kg_meta.get("kg_nodes_created") or (kg_meta.get("kg_ingest_tool_calls_by_name") or {}).get("kg_node_create"),
         "embed_failures": meta.get("embed_failures"),
         "versions": meta.get("versions"),
     }

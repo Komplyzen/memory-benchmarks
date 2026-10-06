@@ -14,7 +14,7 @@ Transport
 ---------
 MCP JSON-RPC over HTTP: ``POST {KG_URL}/mcp`` with a bearer token, method
 ``tools/call``. The REST routes under ``/api/v1`` are NOT used: they execute
-every tool with ``currentSession = null`` and ``kg_node`` refuses to create
+every tool with ``currentSession = null`` and ``kg_node_create`` refuses to create
 without an active session. The MCP route resolves the tenant's active session
 per request, which is exactly the path production agents use.
 
@@ -22,12 +22,12 @@ Ingest: "Komplyt Zero as shipped"
 ---------------------------------
 ``add`` hands each dataset session to an LLM agent equipped with the KG's own
 MCP tools (``kg_agent_ingest.AgentIngestor``). The model decides what to call
-(kg_session, kg_query, kg_node, kg_update, ...). The harness enforces only:
+(kg_session_start, kg_query, kg_node_create, kg_node_update, ...). The harness enforces only:
 
-- every ``kg_node`` / ``kg_record`` create gets ``project=bench-{user_id}`` and
+- every ``kg_node_create`` gets ``project=bench-{user_id}`` and
   a ``date:YYYY-MM-DD`` tag (the date never goes into ``content``);
 - a write without an active session first gets a harness-started session;
-- ``kg_session start`` by the model is deduplicated against the session the
+- ``kg_session_start`` by the model is deduplicated against the session the
   harness already opened for this (user, dataset session), and forced onto the
   benchmark project, so decay fires once per dataset session, not per whim;
 - if the model did not end the session, the harness ends it after the loop.
@@ -92,7 +92,7 @@ KG_TOKEN_HINT = (
 # that was not yet served when the KG server first fetched it.
 KG_CI_TOKEN_HINT = "KG returned 401 Unauthorized: token or JWKS server (KG_CI mode). Check the in-job signer and the JWKS static server."
 KG_CI = bool(os.getenv("KG_CI"))
-WRITE_TOOLS = frozenset({"kg_node", "kg_record", "kg_relate", "kg_update"})
+WRITE_TOOLS = frozenset({"kg_node_create", "kg_node_update", "kg_relate"})
 
 
 class KgError(RuntimeError):
@@ -399,8 +399,7 @@ class KgClient:
 
     async def _start_session(self, user_id: str, key: Any, notes: str | None = None) -> dict[str, Any]:
         project = self.project_for(user_id)
-        resp = await self._call_tool("kg_session", {
-            "action": "start",
+        resp = await self._call_tool("kg_session_start", {
             "project": project,
             "create_project": True,
             "notes": notes or f"memory-benchmarks {user_id} session={key}",
@@ -414,7 +413,7 @@ class KgClient:
         if self._open_session is None:
             return {}
         try:
-            resp = await self._call_tool("kg_session", {"action": "end"})
+            resp = await self._call_tool("kg_session_end", {})
         finally:
             self._open_session = None
         if by_harness:
@@ -449,11 +448,13 @@ class KgClient:
         async def execute(name: str, args: dict[str, Any]) -> str:
             args = dict(args)
             try:
-                if name == "kg_session":
-                    return await self._exec_session(args, user_id, key)
+                if name == "kg_session_start":
+                    return await self._exec_session_start(args, user_id, key)
+                if name == "kg_session_end":
+                    return await self._exec_session_end()
 
-                if name in ("kg_node", "kg_record"):
-                    is_create = name == "kg_record" or args.get("action", "create") == "create"
+                if name in ("kg_node_create", "kg_node_update"):
+                    is_create = name == "kg_node_create"
                     await self._ensure_session_for_write(user_id, key)
                     if is_create:
                         if args.get("project") != project:
@@ -474,7 +475,7 @@ class KgClient:
                         created.append((parsed["id"], parsed.get("content", args.get("content", ""))))
                     return text
 
-                if name in WRITE_TOOLS:  # kg_relate, kg_update
+                if name in WRITE_TOOLS:  # kg_relate
                     await self._ensure_session_for_write(user_id, key)
                 elif name == "kg_query":
                     if args.get("project") != project:
@@ -494,44 +495,36 @@ class KgClient:
 
         return execute
 
-    async def _exec_session(self, args: dict[str, Any], user_id: str, key: Any) -> str:
-        action = args.get("action")
-        if action is None:
-            action = "status" if self._open_session is not None else "start"
-
-        if action == "start":
-            if self._session_matches(user_id, key) or (self.decay == "off" and self._open_session is not None
-                                                        and self.project_for(user_id) in self._projects_ready):
-                self.guardrails["session_start_deduped"] += 1
-                return json.dumps({
-                    "action": "started",
-                    "session_id": self._open_session["id"],
-                    "project": self.project_for(user_id),
-                    "nodes_decayed": 0,
-                    "note": "Session already active for this conversation.",
-                })
-            if self._open_session is not None:
-                if self.decay == "off":
-                    # Different project, decay off: the new project must exist; an
-                    # empty project decays nothing, so this start is harmless.
-                    pass
-                else:
-                    await self._end_session(by_harness=True)
-            resp = await self._start_session(user_id, key, notes=args.get("notes"))
-            return json.dumps(resp)
-
-        if action == "end":
+    async def _exec_session_start(self, args: dict[str, Any], user_id: str, key: Any) -> str:
+        if self._session_matches(user_id, key) or (self.decay == "off" and self._open_session is not None
+                                                    and self.project_for(user_id) in self._projects_ready):
+            self.guardrails["session_start_deduped"] += 1
+            return json.dumps({
+                "action": "started",
+                "session_id": self._open_session["id"],
+                "project": self.project_for(user_id),
+                "nodes_decayed": 0,
+                "note": "Session already active for this conversation.",
+            })
+        if self._open_session is not None:
             if self.decay == "off":
-                self.guardrails["session_end_deferred"] += 1
-                return json.dumps({"action": "ended", "session_id": (self._open_session or {}).get("id"),
-                                   "note": "Acknowledged."})
-            if self._open_session is None:
-                return "Error: No active session. Start a session first with kg_session."
-            resp = await self._end_session()
-            return json.dumps(resp)
+                # Different project, decay off: the new project must exist; an
+                # empty project decays nothing, so this start is harmless.
+                pass
+            else:
+                await self._end_session(by_harness=True)
+        resp = await self._start_session(user_id, key, notes=args.get("notes"))
+        return json.dumps(resp)
 
-        _, text, is_error = await self._call_tool_raw("kg_session", args)
-        return f"Error: {text}" if is_error else text
+    async def _exec_session_end(self) -> str:
+        if self.decay == "off":
+            self.guardrails["session_end_deferred"] += 1
+            return json.dumps({"action": "ended", "session_id": (self._open_session or {}).get("id"),
+                               "note": "Acknowledged."})
+        if self._open_session is None:
+            return "Error: No active session. Start a session first with kg_session_start."
+        resp = await self._end_session()
+        return json.dumps(resp)
 
     # ------------------------------------------------------------------
     # Add
