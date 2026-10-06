@@ -502,8 +502,8 @@ class AgentIngestor:
 
 class ScriptedIngestor:
     """Fixed sequence of tool calls through the same executor/guardrails:
-    session start, one kg_query, three kg_node creates (one with relates_to),
-    one kg_update (status touch, which reactivates), session end. Exercises
+    session start, one kg_query, three kg_node_create calls (one with relates_to),
+    one kg_node_update (status touch, which reactivates), session end. Exercises
     the plumbing without an LLM."""
 
     model = "stub"
@@ -542,17 +542,17 @@ class ScriptedIngestor:
             except json.JSONDecodeError:
                 return None
 
-        await call("kg_session", {"action": "start"})
+        await call("kg_session_start", {})
         await call("kg_query", {"text": texts[0][:200] if texts else "context", "limit": 5})
         for i in range(3):
             content = f"{speaker_a} said: {texts[i % len(texts)][:300]}" if texts else f"placeholder {i}"
-            args: dict[str, Any] = {"action": "create", "type": "observation", "content": content, "tags": ["stub"]}
+            args: dict[str, Any] = {"type": "observation", "content": content, "tags": ["stub"]}
             if i == 2 and created:
                 args["relates_to"] = [created[0]]
-            res = await call("kg_node", args)
+            res = await call("kg_node_create", args)
             if res and res.get("id"):
                 created.append(res["id"])
         if created:
-            await call("kg_update", {"id": created[0], "status": "open"})
-        await call("kg_session", {"action": "end"})
+            await call("kg_node_update", {"id": created[0], "status": "open"})
+        await call("kg_session_end", {})
         self.stats.tool_calls_per_session.append(n_calls)

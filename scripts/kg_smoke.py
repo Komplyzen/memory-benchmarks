@@ -12,7 +12,7 @@ wipe the project.
 
 Default ingest is the MCP agent (needs OPENAI_API_KEY or ANTHROPIC_API_KEY for
 --agent-provider). --stub-agent replaces it with a fixed sequence: session
-start, one kg_query, three kg_node creates (one relates_to), one kg_update,
+start, one kg_query, three kg_node_create calls (one relates_to), one kg_node_update,
 session end, all through the same guardrails.
 
 Needs: a KG HTTP server, a token (`kg auth login` or KG_TOKEN), and root
